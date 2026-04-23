@@ -137,6 +137,13 @@ def main(cfg: DictConfig) -> None:
     train_dir = Path(cfg.dataset.train_dir).resolve()
     all_samples = collect_video_samples(train_dir)
 
+    # Keep only class folders whose names match the validation split — train/ contains
+    # 23 extra folders under an older numeric scheme that duplicate canonical clips
+    # under wrong labels; leaving them in poisons the CE signal.
+    val_dir = Path(cfg.dataset.val_dir).resolve()
+    canonical_classes = {p.name for p in val_dir.iterdir() if p.is_dir()}
+    all_samples = [s for s in all_samples if s[0].parent.name in canonical_classes]
+
     max_samples = cfg.dataset.get("max_samples")
     if max_samples is not None:
         all_samples = all_samples[: int(max_samples)]

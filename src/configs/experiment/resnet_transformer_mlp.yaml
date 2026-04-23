@@ -1,0 +1,4 @@
+# @package _global_
+# Modular experiment: ResNet18 spatial + Transformer temporal + MLP head, from scratch.
+defaults:
+  - override /model: resnet_transformer_mlp
