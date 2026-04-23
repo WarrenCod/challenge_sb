@@ -28,6 +28,7 @@ from models.classifier.linear import LinearClassifier
 from models.classifier.mlp import MLPClassifier
 from models.spatial.resnet import ResNetEncoder
 from models.spatial.vit import ViTEncoder
+from models.temporal.diff_transformer import DiffTransformerTemporal
 from models.temporal.lstm import LSTMTemporal
 from models.temporal.mean_pool import MeanPoolTemporal
 from models.temporal.transformer import TransformerTemporal
@@ -48,6 +49,7 @@ TEMPORAL_REGISTRY: Dict[str, type] = {
     "mean_pool": MeanPoolTemporal,
     "lstm": LSTMTemporal,
     "transformer": TransformerTemporal,
+    "diff_transformer": DiffTransformerTemporal,
 }
 CLASSIFIER_REGISTRY: Dict[str, type] = {
     "linear": LinearClassifier,

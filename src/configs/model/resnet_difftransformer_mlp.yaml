@@ -1,0 +1,19 @@
+# @package _global_
+# ResNet (spatial) + Diff-Transformer (temporal) + MLP (classifier)
+# From scratch — no ImageNet weights.
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: resnet
+    variant: resnet18
+    pretrained: false
+  temporal:
+    name: diff_transformer
+    num_heads: 8
+    num_layers: 2
+    dropout: 0.1
+  classifier:
+    name: mlp
+    hidden_dim: 512
+    dropout: 0.5
