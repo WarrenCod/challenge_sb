@@ -1,0 +1,12 @@
+# @package _global_
+# Channel-Motion Transformer, ResNet-18 from scratch, 20 epochs, T=8
+defaults:
+  - override /model: cmt
+
+dataset:
+  num_frames: 8
+
+training:
+  epochs: 20
+  batch_size: 16
+  lr: 0.0003

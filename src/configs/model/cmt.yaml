@@ -1,0 +1,15 @@
+# @package _global_
+# Channel-Motion Transformer: ResNet-18 frame CNN -> per-channel motion -> set pool
+model:
+  name: cmt
+  pretrained: false
+  num_classes: ${num_classes}
+  num_frames: ${dataset.num_frames}
+  c_prime: 128
+  motion_widths: [96, 192, 384]
+  d: 512
+  set_num_blocks: 4
+  set_num_heads: 8
+  set_ffn_mult: 4
+  head_hidden: 1024
+  dropout: 0.1

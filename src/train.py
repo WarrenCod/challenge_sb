@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
+from models.cmt import CMT
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.modular import build_modular_model
@@ -48,6 +49,20 @@ def build_model(cfg: DictConfig) -> nn.Module:
         )
     if name == "modular":
         return build_modular_model(cfg.model, num_classes=num_classes)
+    if name == "cmt":
+        return CMT(
+            num_classes=num_classes,
+            num_frames=int(cfg.dataset.num_frames),
+            pretrained=bool(cfg.model.pretrained),
+            c_prime=int(cfg.model.c_prime),
+            motion_widths=list(cfg.model.motion_widths),
+            d=int(cfg.model.d),
+            set_num_blocks=int(cfg.model.set_num_blocks),
+            set_num_heads=int(cfg.model.set_num_heads),
+            set_ffn_mult=int(cfg.model.set_ffn_mult),
+            head_hidden=int(cfg.model.head_hidden),
+            dropout=float(cfg.model.dropout),
+        )
 
     raise ValueError(f"Unknown model.name: {name}")
 
