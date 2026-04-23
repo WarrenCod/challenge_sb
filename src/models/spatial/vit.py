@@ -7,17 +7,46 @@ a single (B*T, hidden_dim) vector per frame — matching the (B, T, d) contract.
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 import torch.nn as nn
 from torchvision import models
+from torchvision.models.vision_transformer import VisionTransformer
 
 from models.base import SpatialEncoder
 
 
+def _torchvision_variant(factory, weights_enum) -> Callable[[bool], nn.Module]:
+    def build(pretrained: bool) -> nn.Module:
+        return factory(weights=weights_enum if pretrained else None)
+
+    return build
+
+
+def _custom_variant(**vit_kwargs) -> Callable[[bool], nn.Module]:
+    def build(pretrained: bool) -> nn.Module:
+        if pretrained:
+            raise ValueError(
+                "pretrained=True is not supported for custom ViT variants "
+                "(torchvision ships no weights for this size)."
+            )
+        return VisionTransformer(image_size=224, **vit_kwargs)
+
+    return build
+
+
+# Each entry: variant name -> builder(pretrained) -> nn.Module with `.hidden_dim` + `.heads`.
 _VIT_FACTORIES = {
-    "vit_b_16": (models.vit_b_16, models.ViT_B_16_Weights.IMAGENET1K_V1),
-    "vit_b_32": (models.vit_b_32, models.ViT_B_32_Weights.IMAGENET1K_V1),
-    "vit_l_16": (models.vit_l_16, models.ViT_L_16_Weights.IMAGENET1K_V1),
+    "vit_ti_16": _custom_variant(
+        patch_size=16, num_layers=12, num_heads=3, hidden_dim=192, mlp_dim=768
+    ),
+    "vit_s_16": _custom_variant(
+        patch_size=16, num_layers=12, num_heads=6, hidden_dim=384, mlp_dim=1536
+    ),
+    "vit_b_16": _torchvision_variant(models.vit_b_16, models.ViT_B_16_Weights.IMAGENET1K_V1),
+    "vit_b_32": _torchvision_variant(models.vit_b_32, models.ViT_B_32_Weights.IMAGENET1K_V1),
+    "vit_l_16": _torchvision_variant(models.vit_l_16, models.ViT_L_16_Weights.IMAGENET1K_V1),
 }
 
 
@@ -28,8 +57,7 @@ class ViTEncoder(SpatialEncoder):
             raise ValueError(
                 f"Unknown vit variant: {variant}. Available: {list(_VIT_FACTORIES)}"
             )
-        factory, weights_enum = _VIT_FACTORIES[variant]
-        backbone = factory(weights=weights_enum if pretrained else None)
+        backbone = _VIT_FACTORIES[variant](pretrained)
         self.out_dim = backbone.hidden_dim
         backbone.heads = nn.Identity()
         self.backbone = backbone

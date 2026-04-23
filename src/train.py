@@ -23,10 +23,12 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
+from models.modular import build_modular_model
 from utils import build_transforms, set_seed, split_train_val
 
 
@@ -34,17 +36,18 @@ def build_model(cfg: DictConfig) -> nn.Module:
     """Create the model described by cfg.model.name."""
     name = cfg.model.name
     num_classes = cfg.model.num_classes
-    pretrained = cfg.model.pretrained
 
     if name == "cnn_baseline":
-        return CNNBaseline(num_classes=num_classes, pretrained=pretrained)
+        return CNNBaseline(num_classes=num_classes, pretrained=cfg.model.pretrained)
     if name == "cnn_lstm":
         hidden = cfg.model.get("lstm_hidden_size", 512)
         return CNNLSTM(
             num_classes=num_classes,
-            pretrained=pretrained,
+            pretrained=cfg.model.pretrained,
             lstm_hidden_size=int(hidden),
         )
+    if name == "modular":
+        return build_modular_model(cfg.model, num_classes=num_classes)
 
     raise ValueError(f"Unknown model.name: {name}")
 
@@ -55,6 +58,7 @@ def train_one_epoch(
     loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    epoch_label: str = "",
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the training set for one epoch."""
     model.train()
@@ -62,7 +66,8 @@ def train_one_epoch(
     correct = 0
     total = 0
 
-    for video_batch, labels in data_loader:
+    bar = tqdm(data_loader, desc=f"{epoch_label} train", leave=False, dynamic_ncols=True)
+    for video_batch, labels in bar:
         # video_batch: (B, T, C, H, W), labels: (B,)
         video_batch = video_batch.to(device)
         labels = labels.to(device)
@@ -77,6 +82,7 @@ def train_one_epoch(
         predictions = logits.argmax(dim=1)
         correct += int((predictions == labels).sum().item())
         total += labels.size(0)
+        bar.set_postfix(loss=running_loss / total, acc=correct / total)
 
     average_loss = running_loss / max(total, 1)
     accuracy = correct / max(total, 1)
@@ -89,6 +95,7 @@ def evaluate_epoch(
     data_loader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
+    epoch_label: str = "",
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the validation loader."""
     model.eval()
@@ -96,7 +103,8 @@ def evaluate_epoch(
     correct = 0
     total = 0
 
-    for video_batch, labels in data_loader:
+    bar = tqdm(data_loader, desc=f"{epoch_label} val", leave=False, dynamic_ncols=True)
+    for video_batch, labels in bar:
         video_batch = video_batch.to(device)
         labels = labels.to(device)
 
@@ -107,6 +115,7 @@ def evaluate_epoch(
         predictions = logits.argmax(dim=1)
         correct += int((predictions == labels).sum().item())
         total += labels.size(0)
+        bar.set_postfix(loss=running_loss / total, acc=correct / total)
 
     average_loss = running_loss / max(total, 1)
     accuracy = correct / max(total, 1)
@@ -139,7 +148,10 @@ def main(cfg: DictConfig) -> None:
     )
 
     # Match normalization to pretrained flag (ImageNet stats when using pretrained weights).
-    use_imagenet_norm = bool(cfg.model.pretrained)
+    if cfg.model.name == "modular":
+        use_imagenet_norm = bool(cfg.model.spatial.get("pretrained", False))
+    else:
+        use_imagenet_norm = bool(cfg.model.get("pretrained", False))
     train_transform = build_transforms(
         is_training=True, use_imagenet_norm=use_imagenet_norm
     )
@@ -183,10 +195,13 @@ def main(cfg: DictConfig) -> None:
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
 
     for epoch in range(int(cfg.training.epochs)):
+        label = f"[{epoch + 1}/{cfg.training.epochs}]"
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, loss_fn, optimizer, device
+            model, train_loader, loss_fn, optimizer, device, epoch_label=label
         )
-        val_loss, val_acc = evaluate_epoch(model, val_loader, loss_fn, device)
+        val_loss, val_acc = evaluate_epoch(
+            model, val_loader, loss_fn, device, epoch_label=label
+        )
 
         print(
             f"Epoch {epoch + 1}/{cfg.training.epochs} | "
@@ -200,7 +215,7 @@ def main(cfg: DictConfig) -> None:
                 "model_state_dict": model.state_dict(),
                 "model_name": cfg.model.name,
                 "num_classes": int(cfg.model.num_classes),
-                "pretrained": bool(cfg.model.pretrained),
+                "pretrained": use_imagenet_norm,
                 "num_frames": int(cfg.dataset.num_frames),
                 "val_accuracy": val_acc,
                 "config": OmegaConf.to_container(cfg, resolve=True),
