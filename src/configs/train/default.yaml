@@ -12,3 +12,7 @@ training:
   weight_decay: 0.0
   warmup_epochs: 0
   grad_clip: 0.0
+  # If true and <checkpoint_path>_last.pt exists with a matching config hash,
+  # resume model+optimizer+scheduler+scaler+RNG from it. Set false to force
+  # a fresh run (the existing _last file will be overwritten from epoch 0).
+  resume: true

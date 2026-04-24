@@ -4,9 +4,12 @@ Small helpers: reproducibility, image transforms, and metric computation.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import random
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 import numpy as np
 import torch
@@ -202,3 +205,67 @@ def split_train_val(
         val_samples = val_samples[-1:]
 
     return train_samples, val_samples
+
+
+def atomic_torch_save(obj: Any, path: Path | str) -> None:
+    """Crash-safe torch.save: write to a sibling .tmp file, then atomic rename."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+# Keys that may differ across resumes without invalidating the saved state.
+_RESUME_HASH_HARMLESS = {
+    ("training", "num_workers"),
+    ("training", "device"),
+    ("training", "checkpoint_path"),
+    ("training", "snapshot_every"),
+    ("training", "resume"),
+}
+
+
+def make_resume_hash(cfg, keys: Tuple[str, ...] = ("model", "dataset", "training", "mae")) -> str:
+    """Stable short hash over the config sub-trees that affect resume compatibility."""
+    from omegaconf import OmegaConf
+
+    raw = OmegaConf.to_container(cfg, resolve=True)
+    snapshot = {}
+    for top in keys:
+        if top not in raw:
+            continue
+        sub = raw[top]
+        if isinstance(sub, dict):
+            sub = {k: v for k, v in sub.items() if (top, k) not in _RESUME_HASH_HARMLESS}
+        snapshot[top] = sub
+    blob = json.dumps(snapshot, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def capture_rng_state() -> dict:
+    """Snapshot torch / cuda / numpy / python RNG states for resumable training."""
+    return {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+
+
+def restore_rng_state(state: dict) -> None:
+    """Inverse of capture_rng_state. Tolerates missing fields and map_location moves."""
+    if "torch" in state:
+        t = state["torch"]
+        # torch.set_rng_state requires a CPU ByteTensor; torch.load with
+        # map_location=<cuda> will have moved it, so force it back.
+        if not (isinstance(t, torch.Tensor) and t.device.type == "cpu" and t.dtype == torch.uint8):
+            t = t.cpu().to(torch.uint8)
+        torch.set_rng_state(t)
+    if torch.cuda.is_available() and state.get("cuda") is not None:
+        cuda_states = [s.cpu().to(torch.uint8) if s.device.type != "cpu" else s for s in state["cuda"]]
+        torch.cuda.set_rng_state_all(cuda_states)
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "python" in state:
+        random.setstate(state["python"])

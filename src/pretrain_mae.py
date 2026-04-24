@@ -28,7 +28,14 @@ from tqdm.auto import tqdm
 
 from dataset.frame_dataset import FrameDataset
 from models.mae_vit import MaskedAutoencoderViT
-from utils import build_transforms, set_seed
+from utils import (
+    atomic_torch_save,
+    build_transforms,
+    capture_rng_state,
+    make_resume_hash,
+    restore_rng_state,
+    set_seed,
+)
 
 
 def build_mae_transforms(image_size: int = 224) -> "object":
@@ -135,9 +142,37 @@ def main(cfg: DictConfig) -> None:
     ckpt_path = Path(cfg.training.checkpoint_path).resolve()
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_every = int(cfg.training.get("snapshot_every", 50))
+    last_path = ckpt_path.with_name(ckpt_path.stem + "_last" + ckpt_path.suffix)
+
+    # --- resume from last.pt if present and config matches ---
+    cfg_hash = make_resume_hash(cfg)
+    start_epoch = 0
+    resume_enabled = bool(cfg.training.get("resume", True))
+    if resume_enabled and last_path.exists():
+        print(f"[mae] found resume file: {last_path}")
+        state = torch.load(last_path, map_location=device, weights_only=False)
+        if state.get("cfg_hash") != cfg_hash:
+            raise RuntimeError(
+                f"Resume aborted: config hash mismatch.\n"
+                f"  saved:   {state.get('cfg_hash')}\n"
+                f"  current: {cfg_hash}\n"
+                f"To start fresh, either delete {last_path} or pass training.resume=false."
+            )
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        if scaler is not None and state.get("scaler") is not None:
+            scaler.load_state_dict(state["scaler"])
+        start_epoch = int(state["epoch"])
+        if "rng" in state:
+            restore_rng_state(state["rng"])
+        print(f"[mae] resuming from epoch {start_epoch + 1}/{epochs}")
+    elif not resume_enabled and last_path.exists():
+        print(f"[mae] training.resume=false → ignoring {last_path}")
 
     # --- train ---
-    for epoch in range(epochs):
+    avg: Optional[float] = None
+    for epoch in range(start_epoch, epochs):
         model.train()
         running, seen = 0.0, 0
         t0 = time.time()
@@ -171,9 +206,25 @@ def main(cfg: DictConfig) -> None:
         avg = running / max(1, seen)
         print(f"Epoch {epoch + 1}/{epochs} | mae loss {avg:.4f} | {dt:.2f} min")
 
+        # Per-epoch resumable snapshot (full state, atomic, overwritten).
+        atomic_torch_save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict() if scaler is not None else None,
+                "epoch": epoch + 1,
+                "cfg_hash": cfg_hash,
+                "config": OmegaConf.to_container(cfg, resolve=True),
+                "rng": capture_rng_state(),
+                "mae_train_loss": avg,
+            },
+            last_path,
+        )
+
         # Periodic snapshot + always keep latest encoder-only file.
         if (epoch + 1) % snapshot_every == 0 or (epoch + 1) == epochs:
-            torch.save(
+            atomic_torch_save(
                 {
                     "encoder_state_dict": model.encoder_state_dict(),
                     "config": OmegaConf.to_container(cfg, resolve=True),
@@ -184,7 +235,10 @@ def main(cfg: DictConfig) -> None:
             )
             print(f"  Saved encoder to {ckpt_path} (epoch {epoch + 1})")
 
-    print(f"Done. Final MAE loss: {avg:.4f}")
+    if avg is None:
+        print(f"Nothing to do: resume position ({start_epoch}) is already at epochs ({epochs}).")
+    else:
+        print(f"Done. Final MAE loss: {avg:.4f}")
 
 
 if __name__ == "__main__":

@@ -32,7 +32,16 @@ from models.cmt import CMT
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.modular import build_modular_model
-from utils import build_llrd_param_groups, build_transforms, set_seed, split_train_val
+from utils import (
+    atomic_torch_save,
+    build_llrd_param_groups,
+    build_transforms,
+    capture_rng_state,
+    make_resume_hash,
+    restore_rng_state,
+    set_seed,
+    split_train_val,
+)
 
 
 def build_model(cfg: DictConfig) -> nn.Module:
@@ -288,8 +297,36 @@ def main(cfg: DictConfig) -> None:
 
     best_val_accuracy = 0.0
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
+    last_path = checkpoint_path.with_name(checkpoint_path.stem + "_last" + checkpoint_path.suffix)
 
-    for epoch in range(int(cfg.training.epochs)):
+    # --- resume from last.pt if present and config matches ---
+    cfg_hash = make_resume_hash(cfg)
+    start_epoch = 0
+    resume_enabled = bool(cfg.training.get("resume", True))
+    if resume_enabled and last_path.exists():
+        print(f"[train] found resume file: {last_path}")
+        state = torch.load(last_path, map_location=device, weights_only=False)
+        if state.get("cfg_hash") != cfg_hash:
+            raise RuntimeError(
+                f"Resume aborted: config hash mismatch.\n"
+                f"  saved:   {state.get('cfg_hash')}\n"
+                f"  current: {cfg_hash}\n"
+                f"To start fresh, either delete {last_path} or pass training.resume=false."
+            )
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        if scaler is not None and state.get("scaler") is not None:
+            scaler.load_state_dict(state["scaler"])
+        start_epoch = int(state["epoch"])
+        best_val_accuracy = float(state.get("best_val_accuracy", 0.0))
+        if "rng" in state:
+            restore_rng_state(state["rng"])
+        print(f"[train] resuming from epoch {start_epoch + 1}/{cfg.training.epochs} (best so far {best_val_accuracy:.4f})")
+    elif not resume_enabled and last_path.exists():
+        print(f"[train] training.resume=false → ignoring {last_path}")
+
+    for epoch in range(start_epoch, int(cfg.training.epochs)):
         label = f"[{epoch + 1}/{cfg.training.epochs}]"
         train_loss, train_acc = train_one_epoch(
             model,
@@ -329,10 +366,29 @@ def main(cfg: DictConfig) -> None:
                     cfg.model.get("lstm_hidden_size", 512)
                 )
 
-            torch.save(payload, checkpoint_path)
+            atomic_torch_save(payload, checkpoint_path)
             print(
                 f"  Saved new best model to {checkpoint_path} (val acc={val_acc:.4f})"
             )
+
+        # Per-epoch resumable snapshot (full state, atomic, overwritten).
+        atomic_torch_save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict() if scaler is not None else None,
+                "epoch": epoch + 1,
+                "cfg_hash": cfg_hash,
+                "config": OmegaConf.to_container(cfg, resolve=True),
+                "rng": capture_rng_state(),
+                "best_val_accuracy": best_val_accuracy,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+            },
+            last_path,
+        )
 
     print(f"Done. Best validation accuracy: {best_val_accuracy:.4f}")
 
