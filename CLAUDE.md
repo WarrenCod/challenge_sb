@@ -102,5 +102,6 @@ Class folders are named `NNN_ClassName` (e.g. `000_Closing_something`). The lead
 
 - **Propose changes before editing.** Explain the approach + tradeoffs first; wait for a "go" before modifying files. This is the default mode for this repo.
 - **Always smoke-test before long training.** Use `dataset.max_samples=64 training.epochs=1 training.batch_size=4` (or similar) to verify the pipeline end-to-end before committing GPU hours.
+- **Every training run must survive SSH disconnection.** No exceptions — a full `python src/train.py …` call is never launched in the foreground. Wrap it in `tmux new -s <name> "<cmd> 2>&1 | tee <name>.log"` (preferred) or `nohup <cmd> > <name>.log 2>&1 & disown` (fallback). Smoke tests can stay in the foreground; anything over ~1 min cannot.
 - **Current goal:** design a new architecture, or merge ideas from recent SOTA, to maximize accuracy on the challenge. Both tracks matter. Open to recent ideas — temporal transformers, 3D / (2+1)D CNNs, pretrained video backbones (VideoMAE, TimeSformer, X3D, V-JEPA, etc.), two-stream, masked modeling, distillation. Surface options with tradeoffs rather than picking unilaterally.
 - User background: comfortable with PyTorch; frame explanations accordingly (no need to re-explain basics, but video-specific terminology is worth grounding briefly).
