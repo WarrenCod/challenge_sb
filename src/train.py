@@ -95,6 +95,7 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
+        stepped = True
         if amp and scaler is not None:
             with autocast(device_type=device.type, dtype=torch.float16):
                 logits = model(video_batch)
@@ -103,8 +104,11 @@ def train_one_epoch(
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            prev_scale = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            # Scaler lowers the scale when it skipped the step due to inf/NaN grads.
+            stepped = scaler.get_scale() >= prev_scale
         else:
             logits = model(video_batch)
             loss = loss_fn(logits, labels)
@@ -113,7 +117,7 @@ def train_one_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
-        if scheduler is not None:
+        if scheduler is not None and stepped:
             scheduler.step()
 
         running_loss += float(loss.item()) * labels.size(0)

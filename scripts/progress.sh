@@ -1,57 +1,85 @@
 #!/usr/bin/env bash
-# Print a compact status for a running train.py log:
-#   - all completed-epoch summary lines
-#   - current tqdm line (batch-level progress)
-#   - elapsed time, avg min/epoch, ETA
+# Training progress for a train.py log:
+#   - table of completed-epoch summaries (epoch, losses, accuracies)
+#   - current tqdm batch line
+#   - elapsed, min/epoch (fractional — uses mid-epoch tqdm fraction), ETA
 #
 # Usage:
-#   bash scripts/progress.sh <log_file> [target_epochs]
-#
-# Defaults: log = newest file under logs/, target = 20.
+#   bash scripts/progress.sh                           # newest log, target 20, one-shot
+#   bash scripts/progress.sh <log> <target_epochs>
+#   bash scripts/progress.sh ... --watch               # redraw every 10 s, Ctrl-C to exit
+#   bash scripts/progress.sh ... --watch --interval 5  # custom refresh interval (s)
 
 set -u
 
-LOG="${1:-$(ls -t /Data/challenge_sb/logs/*.log 2>/dev/null | head -1)}"
-TARGET="${2:-20}"
+LOG=""; TARGET=""; WATCH=0; INTERVAL=10
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --watch|-w) WATCH=1 ;;
+        --interval) INTERVAL="$2"; shift ;;
+        *) if [[ -z "$LOG" ]]; then LOG="$1"; elif [[ -z "$TARGET" ]]; then TARGET="$1"; fi ;;
+    esac
+    shift
+done
+LOG="${LOG:-$(ls -t /Data/challenge_sb/logs/*.log 2>/dev/null | head -1)}"
+TARGET="${TARGET:-20}"
 
-if [[ -z "${LOG}" || ! -f "${LOG}" ]]; then
+if [[ -z "$LOG" || ! -f "$LOG" ]]; then
     echo "No log file found (got: '${LOG}')."
     exit 1
 fi
 
-BIRTH=$(stat -c '%W' "${LOG}")
-NOW=$(date +%s)
-ELAPSED=$((NOW - BIRTH))
+render() {
+    local birth now elapsed n cur cur_frac frac per rem
+    birth=$(stat -c '%W' "$LOG")
+    if [[ "$birth" == "-" || "$birth" == "0" ]]; then
+        birth=$(stat -c '%Y' "$LOG")
+    fi
+    now=$(date +%s)
+    elapsed=$((now - birth))
 
-echo "log: ${LOG}"
-echo
+    (( WATCH )) && printf '\033[2J\033[H'
+    printf "log: %s\ntarget: %d epochs   elapsed: %d min\n\n" "$LOG" "$TARGET" "$((elapsed / 60))"
 
-echo "Completed epochs:"
-EPOCH_LINES=$(tr '\r' '\n' < "${LOG}" | grep -E '^Epoch [0-9]+/')
-if [[ -n "${EPOCH_LINES}" ]]; then
-    echo "${EPOCH_LINES}"
-else
-    echo "  (none yet)"
-fi
-echo
-
-# Current batch-level progress (last tqdm redraw)
-CUR=$(tail -c 400 "${LOG}" | tr '\r' '\n' | grep -E '^\[[0-9]+/[0-9]+\]' | tail -1)
-if [[ -n "${CUR}" ]]; then
-    echo "Current: ${CUR}"
+    printf "%-7s %-11s %-10s %-11s %-10s\n" "epoch" "train_loss" "train_acc" "val_loss" "val_acc"
+    tr '\r' '\n' < "$LOG" | awk '
+        match($0, /^Epoch ([0-9]+)\/[0-9]+ \| train loss ([0-9.]+) acc ([0-9.]+) \| val loss ([0-9.]+) acc ([0-9.]+)/, m) {
+            printf "%-7s %-11s %-10s %-11s %-10s\n", m[1], m[2], m[3], m[4], m[5]
+        }'
     echo
-fi
 
-N=$(tr '\r' '\n' < "${LOG}" | grep -cE '^Epoch [0-9]+/')
-ELAPSED_MIN=$((ELAPSED / 60))
+    n=$(tr '\r' '\n' < "$LOG" | grep -cE '^Epoch [0-9]+/')
+    cur=$(tail -c 800 "$LOG" | tr '\r' '\n' | grep -E '^\[[0-9]+/[0-9]+\]' | tail -1)
+    if [[ -n "$cur" ]]; then
+        echo "current: $cur"
+    fi
 
-if [[ "${N}" -gt 0 ]]; then
-    PER=$((ELAPSED / N))
-    REM=$((PER * (TARGET - N)))
-    printf "%d/%d epochs done | %d min elapsed | %d min/epoch avg | ETA %d min (%.1f h remaining)\n" \
-        "${N}" "${TARGET}" "${ELAPSED_MIN}" "$((PER / 60))" "$((REM / 60))" \
-        "$(echo "scale=1; ${REM}/3600" | bc)"
+    cur_frac=0
+    if [[ -n "$cur" ]]; then
+        cur_frac=$(awk 'match($0, /([0-9]+)\/([0-9]+) /, m) { if (m[2]+0 > 0) print m[1]/m[2]; exit }' <<< "$cur")
+        [[ -z "$cur_frac" ]] && cur_frac=0
+    fi
+    frac=$(awk -v n="$n" -v f="$cur_frac" -v t="$TARGET" 'BEGIN { v = n + f; if (v > t) v = t; print v }')
+
+    if awk -v f="$frac" 'BEGIN { exit !(f > 0) }'; then
+        per=$(awk -v e="$elapsed" -v f="$frac" 'BEGIN { print e / f }')
+        rem=$(awk -v p="$per" -v t="$TARGET" -v f="$frac" 'BEGIN { v = p * (t - f); if (v < 0) v = 0; print v }')
+        printf "\n%.2f/%d epochs done | %.1f min/epoch | ETA %.0f min (%.1f h)\n" \
+            "$frac" "$TARGET" \
+            "$(awk -v p="$per" 'BEGIN { print p / 60 }')" \
+            "$(awk -v r="$rem" 'BEGIN { print r / 60 }')" \
+            "$(awk -v r="$rem" 'BEGIN { print r / 3600 }')"
+    else
+        printf "\n0/%d epochs done | (ETA unavailable until first batch landed)\n" "$TARGET"
+    fi
+}
+
+if (( WATCH )); then
+    trap 'echo; exit 0' INT
+    while true; do
+        render
+        sleep "$INTERVAL"
+    done
 else
-    printf "0/%d epochs done | %d min elapsed | (ETA unavailable until epoch 1 completes)\n" \
-        "${TARGET}" "${ELAPSED_MIN}"
+    render
 fi
