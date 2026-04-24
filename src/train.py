@@ -15,13 +15,15 @@ split; the dedicated ``dataset.val_dir`` is for ``evaluate.py`` only.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import hydra
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -73,6 +75,10 @@ def train_one_epoch(
     loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    scaler: Optional[GradScaler] = None,
+    amp: bool = False,
+    grad_clip: float = 0.0,
     epoch_label: str = "",
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the training set for one epoch."""
@@ -84,20 +90,41 @@ def train_one_epoch(
     bar = tqdm(data_loader, desc=f"{epoch_label} train", leave=False, dynamic_ncols=True)
     for video_batch, labels in bar:
         # video_batch: (B, T, C, H, W), labels: (B,)
-        video_batch = video_batch.to(device)
-        labels = labels.to(device)
+        video_batch = video_batch.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        logits = model(video_batch)  # (B, num_classes)
-        loss = loss_fn(logits, labels)
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        if amp and scaler is not None:
+            with autocast(device_type=device.type, dtype=torch.float16):
+                logits = model(video_batch)
+                loss = loss_fn(logits, labels)
+            scaler.scale(loss).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(video_batch)
+            loss = loss_fn(logits, labels)
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+        if scheduler is not None:
+            scheduler.step()
 
         running_loss += float(loss.item()) * labels.size(0)
         predictions = logits.argmax(dim=1)
         correct += int((predictions == labels).sum().item())
         total += labels.size(0)
-        bar.set_postfix(loss=running_loss / total, acc=correct / total)
+        bar.set_postfix(
+            loss=running_loss / total,
+            acc=correct / total,
+            lr=optimizer.param_groups[0]["lr"],
+        )
 
     average_loss = running_loss / max(total, 1)
     accuracy = correct / max(total, 1)
@@ -110,6 +137,7 @@ def evaluate_epoch(
     data_loader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
+    amp: bool = False,
     epoch_label: str = "",
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the validation loader."""
@@ -120,11 +148,16 @@ def evaluate_epoch(
 
     bar = tqdm(data_loader, desc=f"{epoch_label} val", leave=False, dynamic_ncols=True)
     for video_batch, labels in bar:
-        video_batch = video_batch.to(device)
-        labels = labels.to(device)
+        video_batch = video_batch.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
-        logits = model(video_batch)
-        loss = loss_fn(logits, labels)
+        if amp:
+            with autocast(device_type=device.type, dtype=torch.float16):
+                logits = model(video_batch)
+                loss = loss_fn(logits, labels)
+        else:
+            logits = model(video_batch)
+            loss = loss_fn(logits, labels)
 
         running_loss += float(loss.item()) * labels.size(0)
         predictions = logits.argmax(dim=1)
@@ -211,7 +244,31 @@ def main(cfg: DictConfig) -> None:
 
     model = build_model(cfg).to(device)
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.training.lr))
+
+    amp_enabled = bool(cfg.training.get("amp", False)) and device.type == "cuda"
+    weight_decay = float(cfg.training.get("weight_decay", 0.0))
+    warmup_epochs = int(cfg.training.get("warmup_epochs", 0))
+    grad_clip = float(cfg.training.get("grad_clip", 0.0))
+
+    # AdamW with wd=0 is numerically equivalent to Adam, so this is a safe drop-in.
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(cfg.training.lr),
+        weight_decay=weight_decay,
+    )
+
+    total_steps = int(cfg.training.epochs) * len(train_loader)
+    warmup_steps = warmup_epochs * len(train_loader)
+
+    def _lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return (step + 1) / warmup_steps
+        remaining = max(1, total_steps - warmup_steps)
+        progress = (step - warmup_steps) / remaining
+        return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+    scaler = GradScaler(device=device.type) if amp_enabled else None
 
     best_val_accuracy = 0.0
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
@@ -219,10 +276,19 @@ def main(cfg: DictConfig) -> None:
     for epoch in range(int(cfg.training.epochs)):
         label = f"[{epoch + 1}/{cfg.training.epochs}]"
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, loss_fn, optimizer, device, epoch_label=label
+            model,
+            train_loader,
+            loss_fn,
+            optimizer,
+            device,
+            scheduler=scheduler,
+            scaler=scaler,
+            amp=amp_enabled,
+            grad_clip=grad_clip,
+            epoch_label=label,
         )
         val_loss, val_acc = evaluate_epoch(
-            model, val_loader, loss_fn, device, epoch_label=label
+            model, val_loader, loss_fn, device, amp=amp_enabled, epoch_label=label
         )
 
         print(

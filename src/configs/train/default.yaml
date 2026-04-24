@@ -7,3 +7,8 @@ training:
   # Where to save the best checkpoint (by validation accuracy)
   checkpoint_path: ${hydra:runtime.cwd}/best_model.pt
   device: cuda
+  # Off by default so existing experiments reproduce bit-for-bit.
+  amp: false
+  weight_decay: 0.0
+  warmup_epochs: 0
+  grad_clip: 0.0
