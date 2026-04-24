@@ -32,7 +32,7 @@ from models.cmt import CMT
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.modular import build_modular_model
-from utils import build_transforms, set_seed, split_train_val
+from utils import build_llrd_param_groups, build_transforms, set_seed, split_train_val
 
 
 def build_model(cfg: DictConfig) -> nn.Module:
@@ -247,19 +247,31 @@ def main(cfg: DictConfig) -> None:
     )
 
     model = build_model(cfg).to(device)
-    loss_fn = nn.CrossEntropyLoss()
+    label_smoothing = float(cfg.training.get("label_smoothing", 0.0))
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     amp_enabled = bool(cfg.training.get("amp", False)) and device.type == "cuda"
     weight_decay = float(cfg.training.get("weight_decay", 0.0))
     warmup_epochs = int(cfg.training.get("warmup_epochs", 0))
     grad_clip = float(cfg.training.get("grad_clip", 0.0))
 
-    # AdamW with wd=0 is numerically equivalent to Adam, so this is a safe drop-in.
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg.training.lr),
-        weight_decay=weight_decay,
-    )
+    # Layer-wise LR decay (for ViT-MAE fine-tuning). Falls back to a single group otherwise.
+    llrd = float(cfg.training.get("llrd", 0.0))
+    if llrd > 0.0:
+        groups = build_llrd_param_groups(
+            model,
+            base_lr=float(cfg.training.lr),
+            decay_rate=llrd,
+            weight_decay=weight_decay,
+        )
+        optimizer = torch.optim.AdamW(groups)
+        print(f"[train] LLRD enabled (decay={llrd}): {len(groups)} param groups")
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(cfg.training.lr),
+            weight_decay=weight_decay,
+        )
 
     total_steps = int(cfg.training.epochs) * len(train_loader)
     warmup_steps = warmup_epochs * len(train_loader)

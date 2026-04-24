@@ -28,6 +28,7 @@ from models.classifier.linear import LinearClassifier
 from models.classifier.mlp import MLPClassifier
 from models.spatial.resnet import ResNetEncoder
 from models.spatial.vit import ViTEncoder
+from models.spatial.vit_mae import ViTMAEEncoder
 from models.temporal.diff_transformer import DiffTransformerTemporal
 from models.temporal.lstm import LSTMTemporal
 from models.temporal.mean_pool import MeanPoolTemporal
@@ -44,6 +45,7 @@ except ImportError:
 SPATIAL_REGISTRY: Dict[str, type] = {
     "resnet": ResNetEncoder,
     "vit": ViTEncoder,
+    "vit_mae": ViTMAEEncoder,
 }
 TEMPORAL_REGISTRY: Dict[str, type] = {
     "mean_pool": MeanPoolTemporal,

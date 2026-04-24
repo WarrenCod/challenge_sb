@@ -89,6 +89,92 @@ def accuracy_topk(
     return tuple(accuracies)
 
 
+def build_llrd_param_groups(
+    model: "torch.nn.Module",
+    base_lr: float,
+    decay_rate: float = 0.75,
+    weight_decay: float = 0.05,
+    no_decay_names: Tuple[str, ...] = ("bias", "cls_token", "pos_embed"),
+) -> List[dict]:
+    """
+    Layer-wise LR decay for a modular video model with a ViT-MAE spatial slot.
+
+    Layers ordered shallowest (patch_embed) → deepest (final norm); depth D.
+    Each layer gets lr = base_lr * decay_rate ** (D - i), so the deepest encoder
+    layer is ``base_lr`` and the patch_embed gets the most decayed rate.
+    Temporal + classifier heads get ``base_lr`` unscaled.
+
+    1-D params (LayerNorm, bias, CLS / pos-embed) get weight_decay=0.
+    """
+    if not hasattr(model, "spatial") or not hasattr(model.spatial, "ordered_layers"):
+        raise ValueError(
+            "build_llrd_param_groups expects a ModularVideoModel whose spatial encoder "
+            "implements ordered_layers() (e.g. ViTMAEEncoder)."
+        )
+
+    spatial_layers = list(model.spatial.ordered_layers())
+    depth = len(spatial_layers)
+
+    groups: List[dict] = []
+    assigned: set = set()
+
+    # cls_token is not inside any sub-module; attach it to the shallowest layer.
+    shallow_name = spatial_layers[0][0]
+
+    for i, (name, module) in enumerate(spatial_layers):
+        scale = decay_rate ** (depth - 1 - i)  # shallowest → most decayed
+        lr = base_lr * scale
+        params_decay, params_nodecay = [], []
+        for pname, p in module.named_parameters(recurse=True):
+            if not p.requires_grad or id(p) in assigned:
+                continue
+            full = f"spatial.{name}.{pname}"
+            assigned.add(id(p))
+            if p.ndim <= 1 or any(k in pname for k in no_decay_names):
+                params_nodecay.append(p)
+            else:
+                params_decay.append(p)
+        if params_decay:
+            groups.append(
+                {"params": params_decay, "lr": lr, "weight_decay": weight_decay, "group": f"spatial.{name}.decay"}
+            )
+        if params_nodecay:
+            groups.append(
+                {"params": params_nodecay, "lr": lr, "weight_decay": 0.0, "group": f"spatial.{name}.no_decay"}
+            )
+    # cls_token + any spatial params not inside a sub-module.
+    leftover_decay, leftover_nodecay = [], []
+    for pname, p in model.spatial.named_parameters():
+        if id(p) in assigned or not p.requires_grad:
+            continue
+        assigned.add(id(p))
+        if p.ndim <= 1 or any(k in pname for k in no_decay_names):
+            leftover_nodecay.append(p)
+        else:
+            leftover_decay.append(p)
+    leftover_lr = base_lr * (decay_rate ** (depth - 1))  # treat like shallowest
+    if leftover_decay:
+        groups.append({"params": leftover_decay, "lr": leftover_lr, "weight_decay": weight_decay, "group": f"spatial.{shallow_name}.leftover"})
+    if leftover_nodecay:
+        groups.append({"params": leftover_nodecay, "lr": leftover_lr, "weight_decay": 0.0, "group": f"spatial.{shallow_name}.leftover_no_decay"})
+
+    # Head (temporal + classifier): base_lr, no decay at top.
+    head_decay, head_nodecay = [], []
+    for pname, p in model.named_parameters():
+        if id(p) in assigned or not p.requires_grad:
+            continue
+        if p.ndim <= 1 or any(k in pname for k in no_decay_names):
+            head_nodecay.append(p)
+        else:
+            head_decay.append(p)
+    if head_decay:
+        groups.append({"params": head_decay, "lr": base_lr, "weight_decay": weight_decay, "group": "head.decay"})
+    if head_nodecay:
+        groups.append({"params": head_nodecay, "lr": base_lr, "weight_decay": 0.0, "group": "head.no_decay"})
+
+    return groups
+
+
 def split_train_val(
     samples: List[Tuple[Path, int]],
     val_ratio: float,
