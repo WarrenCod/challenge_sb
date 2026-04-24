@@ -36,18 +36,27 @@ Run from the repo root (Hydra resolves `configs/` via `config_path="configs"` in
 D=/Data/processed_data
 DATA="dataset.train_dir=$D/train dataset.val_dir=$D/val dataset.test_dir=$D/test dataset.submission_output=$D/submission.csv"
 
-# Smoke test FIRST — always — before any long run
+# Smoke test FIRST — always — before any long run (short, stays in foreground)
 python src/train.py experiment=baseline_from_scratch $DATA dataset.max_samples=64 training.epochs=1 training.batch_size=4
 
-# Full training
-python src/train.py experiment=baseline_from_scratch $DATA
-python src/train.py experiment=baseline_pretrained   $DATA
-python src/train.py experiment=cnn_lstm              $DATA training.epochs=10 training.batch_size=16
+# Full training — ALWAYS run inside tmux so an SSH drop can't kill the job.
+#   Detach from a live session:  Ctrl-b  then  d
+#   Reattach later:               tmux attach -t train
+#   List sessions:                tmux ls
+#   Kill a stuck session:         tmux kill-session -t train
+# `tee` mirrors tqdm/prints to train.log so you can inspect progress even without reattaching.
+tmux new -s train "python src/train.py experiment=baseline_from_scratch $DATA 2>&1 | tee train.log"
+tmux new -s train "python src/train.py experiment=baseline_pretrained   $DATA 2>&1 | tee train.log"
+tmux new -s train "python src/train.py experiment=cnn_lstm              $DATA training.epochs=10 training.batch_size=16 2>&1 | tee train.log"
 
-# Evaluate
+# If tmux isn't available, the nohup fallback is:
+#   nohup python src/train.py experiment=... $DATA > train.log 2>&1 &  disown
+#   tail -f train.log   # to watch; Ctrl-c only stops tail, not the training
+
+# Evaluate (short, keep in foreground)
 python src/evaluate.py $DATA training.checkpoint_path=best_model.pt
 
-# Submission
+# Submission (short, keep in foreground)
 python src/create_submission.py $DATA training.checkpoint_path=best_model.pt
 ```
 
