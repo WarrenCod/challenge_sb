@@ -1,0 +1,30 @@
+# @package _global_
+# Exp3 (Track 1): iBOT-pretrained ViT-S + 2-layer temporal transformer head.
+# Mirrors exp2; only the encoder checkpoint differs (iBOT instead of MAE).
+defaults:
+  - override /model: vit_mae_transformer
+
+model:
+  spatial:
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/ibot_stage1.pt
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 16
+  lr: 5.0e-4                # gentler than MAE: iBOT features already discriminative
+  llrd: 0.65                # iBOT-typical LLRD (slightly stronger decay)
+  epochs: 50
+  warmup_epochs: 5
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  amp: true
+  grad_clip: 1.0
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp3_ibot_transformer.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  tags: [track1, stage2, ibot, transformer]

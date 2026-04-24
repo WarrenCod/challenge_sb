@@ -32,9 +32,12 @@ from utils import (
     atomic_torch_save,
     build_transforms,
     capture_rng_state,
+    finish_wandb,
+    init_wandb,
     make_resume_hash,
     restore_rng_state,
     set_seed,
+    wandb_log,
 )
 
 
@@ -144,6 +147,8 @@ def main(cfg: DictConfig) -> None:
     snapshot_every = int(cfg.training.get("snapshot_every", 50))
     last_path = ckpt_path.with_name(ckpt_path.stem + "_last" + ckpt_path.suffix)
 
+    init_wandb(cfg, default_run_name=ckpt_path.stem)
+
     # --- resume from last.pt if present and config matches ---
     cfg_hash = make_resume_hash(cfg)
     start_epoch = 0
@@ -205,6 +210,15 @@ def main(cfg: DictConfig) -> None:
         dt = (time.time() - t0) / 60.0
         avg = running / max(1, seen)
         print(f"Epoch {epoch + 1}/{epochs} | mae loss {avg:.4f} | {dt:.2f} min")
+        wandb_log(
+            {
+                "mae/train_loss": avg,
+                "mae/lr": optimizer.param_groups[0]["lr"],
+                "mae/epoch_minutes": dt,
+                "epoch": epoch + 1,
+            },
+            step=epoch + 1,
+        )
 
         # Per-epoch resumable snapshot (full state, atomic, overwritten).
         atomic_torch_save(
@@ -239,6 +253,7 @@ def main(cfg: DictConfig) -> None:
         print(f"Nothing to do: resume position ({start_epoch}) is already at epochs ({epochs}).")
     else:
         print(f"Done. Final MAE loss: {avg:.4f}")
+    finish_wandb()
 
 
 if __name__ == "__main__":

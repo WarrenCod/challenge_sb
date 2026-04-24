@@ -1,0 +1,17 @@
+# @package _global_
+# ResNet18 with Temporal Shift Modules (TSM) inserted before each block's first conv.
+# TSM does the temporal mixing INSIDE the backbone, so the natural classifier
+# head is mean-pool over T (no extra temporal transformer needed).
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: resnet_tsm
+    variant: resnet18
+    num_segments: ${dataset.num_frames}   # must match clip length (T=4 here)
+    fold_div: 8                           # 1/8 channels shifted forward + 1/8 backward
+    pretrained: false                     # Track 1: no ImageNet weights
+  temporal:
+    name: mean_pool
+  classifier:
+    name: linear

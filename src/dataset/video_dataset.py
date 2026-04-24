@@ -105,19 +105,28 @@ class VideoFrameDataset(Dataset):
         self,
         root_dir: str | Path,
         num_frames: int,
-        transform: Callable[[Image.Image], torch.Tensor],
+        transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
         sample_list: Optional[List[Tuple[Path, int]]] = None,
+        clip_transform: Optional[Callable[[List[Image.Image]], torch.Tensor]] = None,
     ) -> None:
         """
         Args:
             root_dir: Split root (contains class folders).
             num_frames: T in the returned tensor (T, C, H, W).
-            transform: Applied independently to each PIL image (typically Resize + ToTensor + Normalize).
-            sample_list: Optional pre-built list of (video_dir, label). Use for train/val splits.
+            transform: Per-frame PIL -> tensor pipeline. Used when clip_transform is None.
+            sample_list: Optional pre-built list of (video_dir, label) for train/val splits.
+            clip_transform: If set, takes the list of PIL frames and returns a (T, C, H, W)
+                tensor directly. Use this for clip-aware augmentations (RandomResizedCrop,
+                ColorJitter, RandAugment) applied identically across frames — required
+                whenever you want temporal coherence under strong aug.
         """
+        if transform is None and clip_transform is None:
+            raise ValueError("VideoFrameDataset needs either transform or clip_transform.")
+
         self.root_dir = Path(root_dir)
         self.num_frames = num_frames
         self.transform = transform
+        self.clip_transform = clip_transform
 
         if sample_list is None:
             self.samples = collect_video_samples(self.root_dir)
@@ -132,16 +141,17 @@ class VideoFrameDataset(Dataset):
         frame_paths = _list_frame_paths(video_dir)
         indices = _pick_frame_indices(len(frame_paths), self.num_frames)
 
-        frames: List[torch.Tensor] = []
+        pil_frames: List[Image.Image] = []
         for frame_index in indices:
             path = frame_paths[frame_index]
             with Image.open(path) as image:
-                rgb_image = image.convert("RGB")
-            # transform: PIL -> (C, H, W)
-            tensor_chw = self.transform(rgb_image)
-            frames.append(tensor_chw)
+                pil_frames.append(image.convert("RGB"))
 
-        # Stack time dimension: (T, C, H, W)
-        video_tensor = torch.stack(frames, dim=0)
+        if self.clip_transform is not None:
+            video_tensor = self.clip_transform(pil_frames)  # (T, C, H, W)
+        else:
+            tensors = [self.transform(img) for img in pil_frames]
+            video_tensor = torch.stack(tensors, dim=0)
+
         label_tensor = torch.tensor(label, dtype=torch.long)
         return video_tensor, label_tensor

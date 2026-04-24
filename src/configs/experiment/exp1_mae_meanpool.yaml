@@ -1,0 +1,27 @@
+# @package _global_
+# Exp1 (Track 1): MAE-pretrained ViT-S + mean-pool over the 4 CLS tokens.
+#   - Stage 1: requires checkpoints/mae_stage1.pt (run pretrain_mae.py first).
+#   - Order-blind temporal head; this is the baseline that isolates spatial features.
+defaults:
+  - override /model: vit_mae_meanpool
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 16            # 16 clips × 4 frames = 64 image-passes/iter (A5000 fits)
+  lr: 1.0e-3                # head LR; encoder layers decayed via LLRD
+  llrd: 0.75
+  epochs: 50
+  warmup_epochs: 5
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  amp: true
+  grad_clip: 1.0
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp1_mae_meanpool.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  tags: [track1, stage2, mae, meanpool]

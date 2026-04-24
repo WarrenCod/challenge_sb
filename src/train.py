@@ -35,12 +35,17 @@ from models.modular import build_modular_model
 from utils import (
     atomic_torch_save,
     build_llrd_param_groups,
+    build_strong_clip_transform,
     build_transforms,
     capture_rng_state,
+    finish_wandb,
+    init_wandb,
     make_resume_hash,
+    mixup_batch,
     restore_rng_state,
     set_seed,
     split_train_val,
+    wandb_log,
 )
 
 
@@ -89,8 +94,13 @@ def train_one_epoch(
     amp: bool = False,
     grad_clip: float = 0.0,
     epoch_label: str = "",
+    mixup_alpha: float = 0.0,
 ) -> Tuple[float, float]:
-    """Returns (average loss, top-1 accuracy) on the training set for one epoch."""
+    """Returns (average loss, top-1 accuracy) on the training set for one epoch.
+
+    With mixup_alpha > 0, accuracy is reported against the dominant label of each mixed
+    pair (y_a). It's only a rough proxy for training fit; trust val/acc instead.
+    """
     model.train()
     running_loss = 0.0
     correct = 0
@@ -102,13 +112,18 @@ def train_one_epoch(
         video_batch = video_batch.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
+        if mixup_alpha > 0:
+            video_batch, (y_a, y_b, lam) = mixup_batch(video_batch, labels, mixup_alpha)
+        else:
+            y_a, y_b, lam = labels, labels, 1.0
+
         optimizer.zero_grad(set_to_none=True)
 
         stepped = True
         if amp and scaler is not None:
             with autocast(device_type=device.type, dtype=torch.float16):
                 logits = model(video_batch)
-                loss = loss_fn(logits, labels)
+                loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
             scaler.scale(loss).backward()
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -120,7 +135,7 @@ def train_one_epoch(
             stepped = scaler.get_scale() >= prev_scale
         else:
             logits = model(video_batch)
-            loss = loss_fn(logits, labels)
+            loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -131,7 +146,7 @@ def train_one_epoch(
 
         running_loss += float(loss.item()) * labels.size(0)
         predictions = logits.argmax(dim=1)
-        correct += int((predictions == labels).sum().item())
+        correct += int((predictions == y_a).sum().item())
         total += labels.size(0)
         bar.set_postfix(
             loss=running_loss / total,
@@ -227,12 +242,27 @@ def main(cfg: DictConfig) -> None:
         is_training=False, use_imagenet_norm=use_imagenet_norm
     )
 
-    train_dataset = VideoFrameDataset(
-        root_dir=train_dir,
-        num_frames=int(cfg.dataset.num_frames),
-        transform=train_transform,
-        sample_list=train_samples,
-    )
+    # Strong clip-aware augmentation (RandomResizedCrop + ColorJitter + RandAugment +
+    # RandomErasing, all consistent across frames). Used when training a temporal model
+    # like TSM where per-frame independent crops would scramble the motion signal.
+    use_strong_aug = bool(cfg.training.get("strong_clip_aug", False))
+    if use_strong_aug:
+        train_clip_transform = build_strong_clip_transform(
+            image_size=224, use_imagenet_norm=use_imagenet_norm
+        )
+        train_dataset = VideoFrameDataset(
+            root_dir=train_dir,
+            num_frames=int(cfg.dataset.num_frames),
+            clip_transform=train_clip_transform,
+            sample_list=train_samples,
+        )
+    else:
+        train_dataset = VideoFrameDataset(
+            root_dir=train_dir,
+            num_frames=int(cfg.dataset.num_frames),
+            transform=train_transform,
+            sample_list=train_samples,
+        )
     val_dataset = VideoFrameDataset(
         root_dir=train_dir,
         num_frames=int(cfg.dataset.num_frames),
@@ -264,9 +294,19 @@ def main(cfg: DictConfig) -> None:
     warmup_epochs = int(cfg.training.get("warmup_epochs", 0))
     grad_clip = float(cfg.training.get("grad_clip", 0.0))
 
-    # Layer-wise LR decay (for ViT-MAE fine-tuning). Falls back to a single group otherwise.
+    # Optimizer: AdamW (default, with optional LLRD), or SGD-momentum (TSM-ResNet recipe).
+    optimizer_name = str(cfg.training.get("optimizer", "adamw")).lower()
     llrd = float(cfg.training.get("llrd", 0.0))
-    if llrd > 0.0:
+    if optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=float(cfg.training.lr),
+            momentum=float(cfg.training.get("momentum", 0.9)),
+            weight_decay=weight_decay,
+            nesterov=bool(cfg.training.get("nesterov", False)),
+        )
+        print(f"[train] SGD optimizer (lr={cfg.training.lr}, momentum={cfg.training.get('momentum', 0.9)})")
+    elif llrd > 0.0:
         groups = build_llrd_param_groups(
             model,
             base_lr=float(cfg.training.lr),
@@ -274,7 +314,7 @@ def main(cfg: DictConfig) -> None:
             weight_decay=weight_decay,
         )
         optimizer = torch.optim.AdamW(groups)
-        print(f"[train] LLRD enabled (decay={llrd}): {len(groups)} param groups")
+        print(f"[train] AdamW + LLRD (decay={llrd}): {len(groups)} param groups")
     else:
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -298,6 +338,8 @@ def main(cfg: DictConfig) -> None:
     best_val_accuracy = 0.0
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
     last_path = checkpoint_path.with_name(checkpoint_path.stem + "_last" + checkpoint_path.suffix)
+
+    init_wandb(cfg, default_run_name=checkpoint_path.stem)
 
     # --- resume from last.pt if present and config matches ---
     cfg_hash = make_resume_hash(cfg)
@@ -326,6 +368,8 @@ def main(cfg: DictConfig) -> None:
     elif not resume_enabled and last_path.exists():
         print(f"[train] training.resume=false → ignoring {last_path}")
 
+    mixup_alpha = float(cfg.training.get("mixup_alpha", 0.0))
+
     for epoch in range(start_epoch, int(cfg.training.epochs)):
         label = f"[{epoch + 1}/{cfg.training.epochs}]"
         train_loss, train_acc = train_one_epoch(
@@ -339,6 +383,7 @@ def main(cfg: DictConfig) -> None:
             amp=amp_enabled,
             grad_clip=grad_clip,
             epoch_label=label,
+            mixup_alpha=mixup_alpha,
         )
         val_loss, val_acc = evaluate_epoch(
             model, val_loader, loss_fn, device, amp=amp_enabled, epoch_label=label
@@ -348,6 +393,17 @@ def main(cfg: DictConfig) -> None:
             f"Epoch {epoch + 1}/{cfg.training.epochs} | "
             f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
             f"val loss {val_loss:.4f} acc {val_acc:.4f}"
+        )
+        wandb_log(
+            {
+                "train/loss": train_loss,
+                "train/acc": train_acc,
+                "val/loss": val_loss,
+                "val/acc": val_acc,
+                "lr": optimizer.param_groups[0]["lr"],
+                "epoch": epoch + 1,
+            },
+            step=epoch + 1,
         )
 
         if val_acc > best_val_accuracy:
@@ -391,6 +447,8 @@ def main(cfg: DictConfig) -> None:
         )
 
     print(f"Done. Best validation accuracy: {best_val_accuracy:.4f}")
+    wandb_log({"val/best_acc": best_val_accuracy})
+    finish_wandb()
 
 
 if __name__ == "__main__":

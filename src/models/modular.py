@@ -27,6 +27,7 @@ from models.base import Classifier, SpatialEncoder, TemporalProcessor
 from models.classifier.linear import LinearClassifier
 from models.classifier.mlp import MLPClassifier
 from models.spatial.resnet import ResNetEncoder
+from models.spatial.resnet_tsm import ResNetTSMEncoder
 from models.spatial.vit import ViTEncoder
 from models.spatial.vit_mae import ViTMAEEncoder
 from models.temporal.diff_transformer import DiffTransformerTemporal
@@ -44,6 +45,7 @@ except ImportError:
 
 SPATIAL_REGISTRY: Dict[str, type] = {
     "resnet": ResNetEncoder,
+    "resnet_tsm": ResNetTSMEncoder,
     "vit": ViTEncoder,
     "vit_mae": ViTMAEEncoder,
 }

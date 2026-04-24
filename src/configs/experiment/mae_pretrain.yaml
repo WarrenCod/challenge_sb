@@ -25,3 +25,8 @@ training:
   num_workers: 8
   checkpoint_path: ${hydra:runtime.cwd}/checkpoints/mae_stage1.pt
   snapshot_every: 50    # save encoder every N epochs
+  device: cuda
+
+wandb:
+  enabled: true
+  tags: [track1, stage1, mae]

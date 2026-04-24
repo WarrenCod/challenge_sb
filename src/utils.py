@@ -9,7 +9,7 @@ import json
 import os
 import random
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -241,6 +241,171 @@ def make_resume_hash(cfg, keys: Tuple[str, ...] = ("model", "dataset", "training
         snapshot[top] = sub
     blob = json.dumps(snapshot, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+class ConsistentClipAug:
+    """Heavy augmentation applied identically across all frames of a clip.
+
+    Independent per-frame transforms would scramble the spatial-temporal
+    correspondence that TSM (and any temporal model) relies on. This applies one
+    set of random params (crop coords, jitter factors, RandAugment op) to every
+    frame in the clip, then ToTensor + Normalize.
+
+    Input: list of PIL.Image frames.
+    Output: (T, C, H, W) float tensor.
+    """
+
+    def __init__(
+        self,
+        image_size: int = 224,
+        scale: Tuple[float, float] = (0.5, 1.0),
+        ratio: Tuple[float, float] = (3 / 4, 4 / 3),
+        brightness: float = 0.4,
+        contrast: float = 0.4,
+        saturation: float = 0.4,
+        hue: float = 0.1,
+        randaug_n: int = 2,
+        randaug_m: int = 9,
+        erase_p: float = 0.25,
+        use_imagenet_norm: bool = True,
+    ) -> None:
+        from torchvision.transforms import ColorJitter, RandAugment, RandomResizedCrop
+
+        self.image_size = image_size
+        self.scale = scale
+        self.ratio = ratio
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.hue = hue
+        self.erase_p = erase_p
+        self._RandomResizedCrop = RandomResizedCrop
+        self._ColorJitter = ColorJitter
+        self._randaug = RandAugment(num_ops=randaug_n, magnitude=randaug_m) if randaug_n > 0 else None
+        if use_imagenet_norm:
+            self._mean = [0.485, 0.456, 0.406]
+            self._std = [0.229, 0.224, 0.225]
+        else:
+            self._mean = [0.5, 0.5, 0.5]
+            self._std = [0.5, 0.5, 0.5]
+
+    def __call__(self, frames):
+        import torchvision.transforms.functional as TF
+
+        # 1. RandomResizedCrop — pick params from the first frame, apply to all.
+        i, j, h, w = self._RandomResizedCrop.get_params(frames[0], scale=self.scale, ratio=self.ratio)
+        frames = [TF.resized_crop(f, i, j, h, w, [self.image_size, self.image_size]) for f in frames]
+
+        # 2. ColorJitter — pick brightness/contrast/saturation/hue once.
+        b_range = (max(0.0, 1 - self.brightness), 1 + self.brightness) if self.brightness > 0 else None
+        c_range = (max(0.0, 1 - self.contrast), 1 + self.contrast) if self.contrast > 0 else None
+        s_range = (max(0.0, 1 - self.saturation), 1 + self.saturation) if self.saturation > 0 else None
+        h_range = (-self.hue, self.hue) if self.hue > 0 else None
+        fn_idx, b, c, s, h_factor = self._ColorJitter.get_params(b_range, c_range, s_range, h_range)
+        jittered = []
+        for img in frames:
+            for fid in fn_idx:
+                if fid == 0 and b is not None:
+                    img = TF.adjust_brightness(img, b)
+                elif fid == 1 and c is not None:
+                    img = TF.adjust_contrast(img, c)
+                elif fid == 2 and s is not None:
+                    img = TF.adjust_saturation(img, s)
+                elif fid == 3 and h_factor is not None:
+                    img = TF.adjust_hue(img, h_factor)
+            jittered.append(img)
+
+        # 3. RandAugment — replay the same RNG seed across frames so each frame
+        # gets the same op. This is approximate (RandAugment also uses internal
+        # state for sub-magnitude jitter) but visually consistent enough for TSM.
+        if self._randaug is not None:
+            seed = random.randint(0, 2**32 - 1)
+            augmented = []
+            for img in jittered:
+                random.seed(seed)
+                torch.manual_seed(seed)
+                augmented.append(self._randaug(img))
+            jittered = augmented
+
+        # 4. ToTensor + Normalize.
+        tensors = [TF.normalize(TF.to_tensor(img), mean=self._mean, std=self._std) for img in jittered]
+        clip = torch.stack(tensors, dim=0)  # (T, C, H, W)
+
+        # 5. RandomErasing — same rectangle erased on every frame.
+        if self.erase_p > 0 and random.random() < self.erase_p:
+            from torchvision.transforms import RandomErasing
+            erase_i, erase_j, erase_h, erase_w, erase_v = RandomErasing.get_params(
+                clip[0], scale=(0.02, 0.33), ratio=(0.3, 3.3), value=[0.0]
+            )
+            clip[:, :, erase_i : erase_i + erase_h, erase_j : erase_j + erase_w] = erase_v
+
+        return clip
+
+
+def build_strong_clip_transform(image_size: int = 224, use_imagenet_norm: bool = True) -> ConsistentClipAug:
+    """Default heavy-aug clip transform for TSM-style training (no hflip, SSv2-safe)."""
+    return ConsistentClipAug(image_size=image_size, use_imagenet_norm=use_imagenet_norm)
+
+
+def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float):
+    """Sample one Mixup λ per batch; return mixed inputs and (y_a, y_b, λ) for loss.
+
+    Loss usage:  loss = lam * ce(logits, y_a) + (1 - lam) * ce(logits, y_b)
+    """
+    if alpha <= 0:
+        return x, (y, y, 1.0)
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(x.size(0), device=x.device)
+    x_mixed = lam * x + (1.0 - lam) * x[perm]
+    return x_mixed, (y, y[perm], lam)
+
+
+def init_wandb(cfg, default_run_name: Optional[str] = None) -> bool:
+    """Initialize a W&B run from cfg.wandb.*; return True if active.
+
+    Tolerates missing wandb dep / unreachable server: prints a warning and continues.
+    """
+    wb_cfg = cfg.get("wandb", {}) or {}
+    if not bool(wb_cfg.get("enabled", False)):
+        return False
+    try:
+        import wandb
+        from omegaconf import OmegaConf
+
+        wandb.init(
+            project=wb_cfg.get("project", "csc43m04ep"),
+            entity=wb_cfg.get("entity"),
+            mode=wb_cfg.get("mode", "online"),
+            name=wb_cfg.get("run_name") or default_run_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+            tags=list(wb_cfg.get("tags", []) or []),
+            resume="allow",
+            id=wb_cfg.get("run_id"),
+        )
+        return True
+    except Exception as e:
+        print(f"[wandb] init failed ({e}); continuing without logging.")
+        return False
+
+
+def wandb_log(metrics: dict, step: Optional[int] = None) -> None:
+    """Log metrics to the active W&B run; no-op if W&B isn't initialized."""
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.log(metrics, step=step)
+    except Exception:
+        pass
+
+
+def finish_wandb() -> None:
+    """Close the active W&B run, if any."""
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.finish()
+    except Exception:
+        pass
 
 
 def capture_rng_state() -> dict:
