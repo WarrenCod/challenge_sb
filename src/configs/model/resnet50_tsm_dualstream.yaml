@@ -1,0 +1,27 @@
+# @package _global_
+# ResNet50 + TSM (residual-branch shift) spatial backbone, dual-stream transformer
+# (interleaved frame + motion-MLP tokens with type embeddings) temporal head,
+# MLP classifier. From scratch — no ImageNet weights.
+#
+# Backbone -> 2048-d per frame; the temporal module projects 2048 -> 512 internally.
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: resnet_tsm
+    variant: resnet50
+    num_segments: ${dataset.num_frames}     # must equal T (TSM is wired for fixed T)
+    fold_div: 8                             # 1/8 channels shifted forward + 1/8 backward
+    pretrained: false                       # Track 1
+  temporal:
+    name: dual_stream_transformer
+    d_model: 512
+    num_heads: 8
+    num_layers: 3
+    dropout: 0.1
+    drop_path: 0.2                          # linear schedule 0.0 -> 0.2 across layers
+    max_frames: 8                           # leave headroom; T=4 currently
+  classifier:
+    name: mlp
+    hidden_dim: 512
+    dropout: 0.5

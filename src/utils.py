@@ -4,8 +4,10 @@ Small helpers: reproducibility, image transforms, and metric computation.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -13,6 +15,7 @@ from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torchvision.transforms as transforms
 
 
@@ -359,6 +362,109 @@ def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float):
     perm = torch.randperm(x.size(0), device=x.device)
     x_mixed = lam * x + (1.0 - lam) * x[perm]
     return x_mixed, (y, y[perm], lam)
+
+
+def cutmix_batch(x: torch.Tensor, y: torch.Tensor, alpha: float):
+    """CutMix on a clip batch (B, T, C, H, W): same rectangle pasted across all frames.
+
+    Returns the mixed clip and (y_a, y_b, lam). lam is the unmodified-area fraction.
+    """
+    if alpha <= 0:
+        return x, (y, y, 1.0)
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(x.size(0), device=x.device)
+
+    h, w = x.shape[-2], x.shape[-1]
+    cut_ratio = math.sqrt(1.0 - lam)
+    cut_h = int(h * cut_ratio)
+    cut_w = int(w * cut_ratio)
+    if cut_h <= 0 or cut_w <= 0:
+        return x, (y, y, 1.0)
+    cy = np.random.randint(h)
+    cx = np.random.randint(w)
+    y1 = max(0, cy - cut_h // 2)
+    y2 = min(h, cy + cut_h // 2)
+    x1 = max(0, cx - cut_w // 2)
+    x2 = min(w, cx + cut_w // 2)
+    if y2 == y1 or x2 == x1:
+        return x, (y, y, 1.0)
+
+    x_mixed = x.clone()
+    x_mixed[:, :, :, y1:y2, x1:x2] = x[perm][:, :, :, y1:y2, x1:x2]
+    lam_adj = 1.0 - ((y2 - y1) * (x2 - x1)) / float(h * w)
+    return x_mixed, (y, y[perm], lam_adj)
+
+
+def build_two_group_param_groups(
+    model: nn.Module,
+    head_lr: float,
+    backbone_lr: float,
+    weight_decay: float,
+    backbone_prefix: str = "spatial.",
+    no_decay_names: Tuple[str, ...] = (
+        "bias",
+        "cls_token",
+        "pos_embed",
+        "type_frame",
+        "type_motion",
+    ),
+) -> List[dict]:
+    """Two LR groups: backbone (spatial.*) at backbone_lr; everything else at head_lr.
+
+    1-D params (norms, biases, type/pos/CLS embeddings) get weight_decay=0 in their
+    respective groups.
+    """
+    backbone_decay, backbone_nodecay = [], []
+    head_decay, head_nodecay = [], []
+    for pname, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_backbone = pname.startswith(backbone_prefix)
+        is_nodecay = p.ndim <= 1 or any(k in pname for k in no_decay_names)
+        if is_backbone and is_nodecay:
+            backbone_nodecay.append(p)
+        elif is_backbone:
+            backbone_decay.append(p)
+        elif is_nodecay:
+            head_nodecay.append(p)
+        else:
+            head_decay.append(p)
+
+    groups: List[dict] = []
+    if backbone_decay:
+        groups.append({"params": backbone_decay, "lr": backbone_lr, "weight_decay": weight_decay, "group": "backbone.decay"})
+    if backbone_nodecay:
+        groups.append({"params": backbone_nodecay, "lr": backbone_lr, "weight_decay": 0.0, "group": "backbone.no_decay"})
+    if head_decay:
+        groups.append({"params": head_decay, "lr": head_lr, "weight_decay": weight_decay, "group": "head.decay"})
+    if head_nodecay:
+        groups.append({"params": head_nodecay, "lr": head_lr, "weight_decay": 0.0, "group": "head.no_decay"})
+    return groups
+
+
+class ModelEMA:
+    """Exponential moving average of model parameters and buffers.
+
+    Update at every optimizer step (or after warmup). Evaluate / save the .module
+    instead of the live model — usually +0.5–2 pt on video classifiers.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
+        self.decay = decay
+        self.module = copy.deepcopy(model).eval()
+        for p in self.module.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        d = self.decay
+        for ema_p, p in zip(self.module.parameters(), model.parameters()):
+            if torch.is_floating_point(ema_p):
+                ema_p.mul_(d).add_(p.detach(), alpha=1.0 - d)
+            else:
+                ema_p.copy_(p.detach())
+        for ema_b, b in zip(self.module.buffers(), model.buffers()):
+            ema_b.copy_(b.detach())
 
 
 def init_wandb(cfg, default_run_name: Optional[str] = None) -> bool:
