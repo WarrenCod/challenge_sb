@@ -33,10 +33,13 @@ class TransformerTemporal(TemporalProcessor):
         if dim_feedforward is None:
             dim_feedforward = in_dim * 4
 
+        # Zero-init cls_token + pos_embed: at step 0 the temporal transformer
+        # behaves order-blind (no positional signal) and the prepended CLS is a
+        # neutral query. The temporal head degenerates to a learned mean-pool
+        # initially and gradually grows order-awareness as gradients populate
+        # pos_embed. Avoids the divergence we saw at lr=1e-3 with trunc_normal.
         self.cls_token = nn.Parameter(torch.zeros(1, 1, in_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, max_len + 1, in_dim))
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=in_dim,
