@@ -210,3 +210,5 @@ data/
 outputs/
 *.pt
 processed_data/
+wandb/
+logs/
