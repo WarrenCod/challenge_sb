@@ -1,6 +1,11 @@
 # @package _global_
 # Exp3 (Track 1): iBOT-pretrained ViT-S + 2-layer temporal transformer head.
-# Mirrors exp2; only the encoder checkpoint differs (iBOT instead of MAE).
+# Best-effort per encoder: head architecture, num_frames, batch_size, epochs,
+# warmup, weight_decay, label_smoothing, grad_clip, AMP all match exp2.
+# LR (5e-4 vs exp2's 1e-3) and LLRD (0.65 vs 0.75) are intentionally retuned
+# for iBOT's more discriminative per-frame features. This is a "best run each"
+# protocol, NOT an apples-to-apples encoder swap — the encoder vs recipe
+# contributions to any exp2↔exp3 delta are not separable.
 defaults:
   - override /model: vit_mae_transformer
 

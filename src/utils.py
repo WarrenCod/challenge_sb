@@ -46,10 +46,11 @@ def build_transforms(
         normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
     if is_training:
+        # No RandomHorizontalFlip: SSv2 labels are direction-sensitive
+        # (e.g. "Pushing X from left to right" vs "... right to left").
         return transforms.Compose(
             [
                 transforms.Resize((image_size, image_size)),
-                transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
                 normalize,
             ]

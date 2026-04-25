@@ -1,0 +1,43 @@
+{
+  "os":  "Linux-5.14.0-611.49.1.el9_7.x86_64-x86_64-with-glibc2.34",
+  "python":  "CPython 3.12.13",
+  "startedAt":  "2026-04-25T12:31:58.122741Z",
+  "args":  [
+    "experiment=exp2_mae_transformer"
+  ],
+  "program":  "/Data/challenge_sb/src/train.py",
+  "codePath":  "src/train.py",
+  "codePathLocal":  "src/train.py",
+  "git":  {
+    "remote":  "https://github.com/WarrenCod/challenge_sb.git",
+    "commit":  "1c8ff180808e4437941bd7498ca920b729c0268a"
+  },
+  "email":  "stan.mischler@yahoo.com",
+  "root":  "/Data/challenge_sb",
+  "host":  "jabiru.polytechnique.fr",
+  "executable":  "/Data/challenge_sb/.venv/bin/python",
+  "cpu_count":  8,
+  "cpu_count_logical":  16,
+  "gpu":  "NVIDIA RTX A5000",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "4227858432",
+      "used":  "1259302912"
+    }
+  },
+  "memory":  {
+    "total":  "66878324736"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA RTX A5000",
+      "memoryTotal":  "25757220864",
+      "cudaCores":  8192,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-ba01780f-38f6-fc05-9c41-5fecbc2864a4"
+    }
+  ],
+  "cudaVersion":  "13.2",
+  "writerId":  "gn2v604hh0w1hqa0u8vwd4k4ia5g10il"
+}

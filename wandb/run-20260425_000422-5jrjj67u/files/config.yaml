@@ -1,0 +1,122 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            p8zaywdpk4eka9ohc3ousup8nznse9ss:
+                args:
+                    - experiment=mae_pretrain
+                codePath: src/pretrain_mae.py
+                codePathLocal: src/pretrain_mae.py
+                cpu_count: 8
+                cpu_count_logical: 16
+                cudaVersion: "13.2"
+                disk:
+                    /:
+                        total: "4227858432"
+                        used: "1259302912"
+                email: stan.mischler@yahoo.com
+                executable: /Data/challenge_sb/.venv/bin/python
+                git:
+                    commit: 1c8ff180808e4437941bd7498ca920b729c0268a
+                    remote: https://github.com/WarrenCod/challenge_sb.git
+                gpu: NVIDIA RTX A5000
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 8192
+                      memoryTotal: "25757220864"
+                      name: NVIDIA RTX A5000
+                      uuid: GPU-ba01780f-38f6-fc05-9c41-5fecbc2864a4
+                host: jabiru.polytechnique.fr
+                memory:
+                    total: "66878324736"
+                os: Linux-5.14.0-611.49.1.el9_7.x86_64-x86_64-with-glibc2.34
+                program: /Data/challenge_sb/src/pretrain_mae.py
+                python: CPython 3.12.13
+                root: /Data/challenge_sb
+                startedAt: "2026-04-24T22:04:22.804147Z"
+                writerId: p8zaywdpk4eka9ohc3ousup8nznse9ss
+        m: []
+        python_version: 3.12.13
+        t:
+            "1":
+                - 1
+                - 41
+                - 49
+                - 50
+                - 63
+            "2":
+                - 1
+                - 41
+                - 49
+                - 50
+                - 63
+            "3":
+                - 2
+                - 13
+                - 15
+                - 16
+                - 61
+            "4": 3.12.13
+            "5": 0.26.1
+            "8":
+                - 2
+            "12": 0.26.1
+            "13": linux-x86_64
+dataset:
+    value:
+        max_samples: null
+        num_frames: 4
+        seed: 42
+        submission_output: /Data/challenge_sb/processed_data/submission.csv
+        test_dir: /Data/challenge_sb/processed_data/test
+        train_dir: /Data/challenge_sb/processed_data/train
+        val_dir: /Data/challenge_sb/processed_data/val
+        val_ratio: 0.2
+mae:
+    value:
+        decoder_depth: 4
+        decoder_embed_dim: 192
+        decoder_num_heads: 6
+        depth: 12
+        embed_dim: 384
+        image_size: 224
+        mask_ratio: 0.75
+        mlp_ratio: 4
+        norm_pix_loss: true
+        num_heads: 6
+        patch_size: 16
+model:
+    value:
+        name: cnn_baseline
+        num_classes: 33
+        pretrained: true
+num_classes:
+    value: 33
+training:
+    value:
+        amp: true
+        base_lr: 0.00015
+        batch_size: 256
+        checkpoint_path: /Data/challenge_sb/checkpoints/mae_stage1.pt
+        device: cuda
+        epochs: 400
+        grad_clip: 0
+        lr: 0.0001
+        num_workers: 8
+        resume: true
+        snapshot_every: 50
+        warmup_epochs: 40
+        weight_decay: 0.05
+wandb:
+    value:
+        enabled: true
+        entity: null
+        mode: online
+        project: csc43m04ep
+        run_id: null
+        run_name: null
+        tags:
+            - track1
+            - stage1
+            - mae
