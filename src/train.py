@@ -167,7 +167,6 @@ def train_one_epoch(
 
         if scheduler is not None and stepped:
             scheduler.step()
-
         if ema is not None and stepped:
             ema.update(model)
 
@@ -370,10 +369,15 @@ def main(cfg: DictConfig) -> None:
 
     total_steps = int(cfg.training.epochs) * len(train_loader)
     warmup_steps = warmup_epochs * len(train_loader)
+    lr_schedule = str(cfg.training.get("lr_schedule", "cosine")).lower()
+    if lr_schedule not in ("cosine", "constant"):
+        raise ValueError(f"Unknown lr_schedule: {lr_schedule!r} (expected 'cosine' or 'constant')")
 
     def _lr_lambda(step: int) -> float:
         if warmup_steps > 0 and step < warmup_steps:
             return (step + 1) / warmup_steps
+        if lr_schedule == "constant":
+            return 1.0
         remaining = max(1, total_steps - warmup_steps)
         progress = (step - warmup_steps) / remaining
         return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
