@@ -24,4 +24,5 @@ training:
 
 wandb:
   enabled: true
+  run_name: mae_transf_cleaned
   tags: [track1, stage2, mae, transformer]

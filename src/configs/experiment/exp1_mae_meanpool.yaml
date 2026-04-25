@@ -24,4 +24,5 @@ training:
 
 wandb:
   enabled: true
+  run_name: mae_avgpool_cleaned
   tags: [track1, stage2, mae, meanpool]
