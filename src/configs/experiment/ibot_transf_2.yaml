@@ -1,0 +1,39 @@
+# @package _global_
+# ibot_transf_2 — second pass on iBOT-Stage1 + temporal transformer (Track 1).
+# Built on top of exp3_ibot_transformer (run "ibot_transformer_cleaned"), which
+# peaked at val acc 0.302 at epoch 48/50 with train acc 0.317 — clear underfit
+# and barely any aug. Changes are summarised in notes/ibot_transf_2.md.
+defaults:
+  - override /model: vit_mae_transformer
+
+model:
+  spatial:
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/ibot_stage1.pt
+
+dataset:
+  num_frames: 4               # forced: every video on disk has exactly 4 frames
+
+training:
+  batch_size: 32              # was 16; bf16 + same num_frames, headroom on A5000
+  lr: 5.0e-4
+  llrd: 0.78                  # was 0.65; let the encoder adapt more (was near-frozen)
+  epochs: 80                  # was 50; v1 was still climbing at epoch 48
+  warmup_epochs: 5
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  amp: true
+  amp_dtype: bf16             # was fp16; Ampere-safe, drops the GradScaler
+  grad_clip: 1.0
+  strong_clip_aug: true       # NEW: RRC + ColorJitter + RandAugment + RandomErasing (no hflip/vflip — SSv2 safe)
+  mixup_alpha: 0.2            # NEW
+  cutmix_alpha: 1.0           # NEW: 50/50 with mixup per batch
+  ema: true                   # NEW
+  ema_decay: 0.9998
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/ibot_transf_2.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: ibot_transf_2
+  tags: [track1, stage2, ibot, transformer, v2]
