@@ -16,6 +16,7 @@ split; the dedicated ``dataset.val_dir`` is for ``evaluate.py`` only.
 from __future__ import annotations
 
 import math
+import random
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -33,11 +34,14 @@ from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.modular import build_modular_model
 from utils import (
+    ModelEMA,
     atomic_torch_save,
     build_llrd_param_groups,
     build_strong_clip_transform,
     build_transforms,
+    build_two_group_param_groups,
     capture_rng_state,
+    cutmix_batch,
     finish_wandb,
     init_wandb,
     make_resume_hash,
@@ -92,14 +96,17 @@ def train_one_epoch(
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     scaler: Optional[GradScaler] = None,
     amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
     grad_clip: float = 0.0,
     epoch_label: str = "",
     mixup_alpha: float = 0.0,
+    cutmix_alpha: float = 0.0,
+    ema: Optional[ModelEMA] = None,
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the training set for one epoch.
 
-    With mixup_alpha > 0, accuracy is reported against the dominant label of each mixed
-    pair (y_a). It's only a rough proxy for training fit; trust val/acc instead.
+    With mix augmentation, accuracy is reported against the dominant label of each
+    mixed pair (y_a). It's only a rough proxy for training fit; trust val/acc instead.
     """
     model.train()
     running_loss = 0.0
@@ -112,8 +119,16 @@ def train_one_epoch(
         video_batch = video_batch.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        if mixup_alpha > 0:
+        # Alternate Mixup / CutMix per batch when both are enabled.
+        if mixup_alpha > 0 and cutmix_alpha > 0:
+            if random.random() < 0.5:
+                video_batch, (y_a, y_b, lam) = mixup_batch(video_batch, labels, mixup_alpha)
+            else:
+                video_batch, (y_a, y_b, lam) = cutmix_batch(video_batch, labels, cutmix_alpha)
+        elif mixup_alpha > 0:
             video_batch, (y_a, y_b, lam) = mixup_batch(video_batch, labels, mixup_alpha)
+        elif cutmix_alpha > 0:
+            video_batch, (y_a, y_b, lam) = cutmix_batch(video_batch, labels, cutmix_alpha)
         else:
             y_a, y_b, lam = labels, labels, 1.0
 
@@ -121,7 +136,7 @@ def train_one_epoch(
 
         stepped = True
         if amp and scaler is not None:
-            with autocast(device_type=device.type, dtype=torch.float16):
+            with autocast(device_type=device.type, dtype=amp_dtype):
                 logits = model(video_batch)
                 loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
             scaler.scale(loss).backward()
@@ -133,6 +148,15 @@ def train_one_epoch(
             scaler.update()
             # Scaler lowers the scale when it skipped the step due to inf/NaN grads.
             stepped = scaler.get_scale() >= prev_scale
+        elif amp:
+            # bf16 path: no grad scaler needed.
+            with autocast(device_type=device.type, dtype=amp_dtype):
+                logits = model(video_batch)
+                loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
         else:
             logits = model(video_batch)
             loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
@@ -143,6 +167,8 @@ def train_one_epoch(
 
         if scheduler is not None and stepped:
             scheduler.step()
+        if ema is not None and stepped:
+            ema.update(model)
 
         running_loss += float(loss.item()) * labels.size(0)
         predictions = logits.argmax(dim=1)
@@ -166,6 +192,7 @@ def evaluate_epoch(
     loss_fn: nn.Module,
     device: torch.device,
     amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
     epoch_label: str = "",
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the validation loader."""
@@ -180,7 +207,7 @@ def evaluate_epoch(
         labels = labels.to(device, non_blocking=True)
 
         if amp:
-            with autocast(device_type=device.type, dtype=torch.float16):
+            with autocast(device_type=device.type, dtype=amp_dtype):
                 logits = model(video_batch)
                 loss = loss_fn(logits, labels)
         else:
@@ -290,13 +317,19 @@ def main(cfg: DictConfig) -> None:
     loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     amp_enabled = bool(cfg.training.get("amp", False)) and device.type == "cuda"
+    amp_dtype_str = str(cfg.training.get("amp_dtype", "fp16")).lower()
+    if amp_dtype_str in ("bf16", "bfloat16"):
+        amp_dtype = torch.bfloat16
+    else:
+        amp_dtype = torch.float16
     weight_decay = float(cfg.training.get("weight_decay", 0.0))
     warmup_epochs = int(cfg.training.get("warmup_epochs", 0))
     grad_clip = float(cfg.training.get("grad_clip", 0.0))
 
-    # Optimizer: AdamW (default, with optional LLRD), or SGD-momentum (TSM-ResNet recipe).
+    # Optimizer: AdamW (default, with optional LLRD or backbone/head split), or SGD-momentum.
     optimizer_name = str(cfg.training.get("optimizer", "adamw")).lower()
     llrd = float(cfg.training.get("llrd", 0.0))
+    backbone_lr = cfg.training.get("backbone_lr", None)
     if optimizer_name == "sgd":
         optimizer = torch.optim.SGD(
             model.parameters(),
@@ -315,6 +348,18 @@ def main(cfg: DictConfig) -> None:
         )
         optimizer = torch.optim.AdamW(groups)
         print(f"[train] AdamW + LLRD (decay={llrd}): {len(groups)} param groups")
+    elif backbone_lr is not None:
+        groups = build_two_group_param_groups(
+            model,
+            head_lr=float(cfg.training.lr),
+            backbone_lr=float(backbone_lr),
+            weight_decay=weight_decay,
+        )
+        optimizer = torch.optim.AdamW(groups)
+        print(
+            f"[train] AdamW + 2-group LR: backbone={backbone_lr}, head={cfg.training.lr}, "
+            f"{len(groups)} param groups"
+        )
     else:
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -324,16 +369,33 @@ def main(cfg: DictConfig) -> None:
 
     total_steps = int(cfg.training.epochs) * len(train_loader)
     warmup_steps = warmup_epochs * len(train_loader)
+    lr_schedule = str(cfg.training.get("lr_schedule", "cosine")).lower()
+    if lr_schedule not in ("cosine", "constant"):
+        raise ValueError(f"Unknown lr_schedule: {lr_schedule!r} (expected 'cosine' or 'constant')")
 
     def _lr_lambda(step: int) -> float:
         if warmup_steps > 0 and step < warmup_steps:
             return (step + 1) / warmup_steps
+        if lr_schedule == "constant":
+            return 1.0
         remaining = max(1, total_steps - warmup_steps)
         progress = (step - warmup_steps) / remaining
         return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
-    scaler = GradScaler(device=device.type) if amp_enabled else None
+    # GradScaler is only useful for fp16 — bf16 has the same exponent range as fp32.
+    scaler = (
+        GradScaler(device=device.type)
+        if (amp_enabled and amp_dtype == torch.float16)
+        else None
+    )
+
+    # Optional EMA of weights — typically +0.5–2 pt on video classifiers.
+    ema: Optional[ModelEMA] = None
+    if bool(cfg.training.get("ema", False)):
+        ema_decay = float(cfg.training.get("ema_decay", 0.9999))
+        ema = ModelEMA(model, decay=ema_decay)
+        print(f"[train] EMA enabled (decay={ema_decay})")
 
     best_val_accuracy = 0.0
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
@@ -360,6 +422,8 @@ def main(cfg: DictConfig) -> None:
         scheduler.load_state_dict(state["scheduler"])
         if scaler is not None and state.get("scaler") is not None:
             scaler.load_state_dict(state["scaler"])
+        if ema is not None and state.get("ema") is not None:
+            ema.module.load_state_dict(state["ema"])
         start_epoch = int(state["epoch"])
         best_val_accuracy = float(state.get("best_val_accuracy", 0.0))
         if "rng" in state:
@@ -369,6 +433,7 @@ def main(cfg: DictConfig) -> None:
         print(f"[train] training.resume=false → ignoring {last_path}")
 
     mixup_alpha = float(cfg.training.get("mixup_alpha", 0.0))
+    cutmix_alpha = float(cfg.training.get("cutmix_alpha", 0.0))
 
     for epoch in range(start_epoch, int(cfg.training.epochs)):
         label = f"[{epoch + 1}/{cfg.training.epochs}]"
@@ -381,12 +446,22 @@ def main(cfg: DictConfig) -> None:
             scheduler=scheduler,
             scaler=scaler,
             amp=amp_enabled,
+            amp_dtype=amp_dtype,
             grad_clip=grad_clip,
             epoch_label=label,
             mixup_alpha=mixup_alpha,
+            cutmix_alpha=cutmix_alpha,
+            ema=ema,
         )
+        eval_model = ema.module if ema is not None else model
         val_loss, val_acc = evaluate_epoch(
-            model, val_loader, loss_fn, device, amp=amp_enabled, epoch_label=label
+            eval_model,
+            val_loader,
+            loss_fn,
+            device,
+            amp=amp_enabled,
+            amp_dtype=amp_dtype,
+            epoch_label=label,
         )
 
         print(
@@ -408,8 +483,10 @@ def main(cfg: DictConfig) -> None:
 
         if val_acc > best_val_accuracy:
             best_val_accuracy = val_acc
+            # When EMA is on, save the EMA weights (those are what just got val'd).
+            best_state_dict = (ema.module if ema is not None else model).state_dict()
             payload: Dict[str, Any] = {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": best_state_dict,
                 "model_name": cfg.model.name,
                 "num_classes": int(cfg.model.num_classes),
                 "pretrained": use_imagenet_norm,
@@ -431,6 +508,7 @@ def main(cfg: DictConfig) -> None:
         atomic_torch_save(
             {
                 "model": model.state_dict(),
+                "ema": ema.module.state_dict() if ema is not None else None,
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict() if scaler is not None else None,

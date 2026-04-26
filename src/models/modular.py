@@ -31,6 +31,7 @@ from models.spatial.resnet_tsm import ResNetTSMEncoder
 from models.spatial.vit import ViTEncoder
 from models.spatial.vit_mae import ViTMAEEncoder
 from models.temporal.diff_transformer import DiffTransformerTemporal
+from models.temporal.dual_stream_transformer import DualStreamTransformerTemporal
 from models.temporal.lstm import LSTMTemporal
 from models.temporal.mean_pool import MeanPoolTemporal
 from models.temporal.transformer import TransformerTemporal
@@ -54,6 +55,7 @@ TEMPORAL_REGISTRY: Dict[str, type] = {
     "lstm": LSTMTemporal,
     "transformer": TransformerTemporal,
     "diff_transformer": DiffTransformerTemporal,
+    "dual_stream_transformer": DualStreamTransformerTemporal,
 }
 CLASSIFIER_REGISTRY: Dict[str, type] = {
     "linear": LinearClassifier,

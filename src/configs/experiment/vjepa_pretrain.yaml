@@ -1,0 +1,43 @@
+# @package _global_
+# V-JEPA self-supervised pretraining on unlabeled clips.
+# Entry point: `python src/pretrain_vjepa.py experiment=vjepa_pretrain`
+
+vjepa:
+  image_size: 112
+  num_frames: 16
+  tubelet_time: 2       # 2 frames per tubelet → 8 temporal positions
+  tubelet_size: 16      # 16x16 patches → 7x7 spatial positions at 112
+  embed_dim: 384        # ViT-S
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  predictor_embed_dim: 192
+  predictor_depth: 6
+  predictor_num_heads: 6
+
+  # Masking strategies (per-batch, 50/50 mix)
+  p_spatial: 0.5                # prob(spatial_block_mask); 1-p → temporal_future_mask
+  spatial_mask_ratio: 0.7       # target fraction of tubelets masked
+  spatial_mask_n_blocks: 3
+  temporal_keep_first: 5        # out of 8 tubelet-time positions → mask last 3 (last 6 frames)
+
+training:
+  batch_size: 64
+  base_lr: 1.5e-4       # effective lr = base_lr * batch_size / 256
+  weight_decay: 0.04
+  epochs: 60
+  warmup_epochs: 5
+  amp: true
+  num_workers: 6
+  grad_clip: 1.0
+
+  # EMA schedule for target encoder (cosine from start → end across total steps).
+  ema_momentum_start: 0.996
+  ema_momentum_end: 1.0
+
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1.pt
+  snapshot_every: 5             # save encoder every N epochs
+  diag_every: 50                # log embedding std every N steps
+
+  # Smoke-test knob: limit to K batches/epoch. Leave null for full runs.
+  limit_batches: null

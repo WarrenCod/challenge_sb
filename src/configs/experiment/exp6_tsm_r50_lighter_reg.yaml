@@ -1,0 +1,40 @@
+# @package _global_
+# Exp6 (Track 1): exp5 with lightened regularization to fix underfitting.
+# Diagnosis: exp5 ended train_acc=0.504 << val_acc(EMA)=0.580 after a fully
+# exhausted cosine. T=4 (hard cap) + from-scratch R50 + heavy reg = too tight.
+# Single-axis ablation vs exp5: only label_smoothing, mixup_alpha, weight_decay,
+# and head dropout change. Architecture / optimizer / schedule are identical.
+defaults:
+  - override /model: tsm_resnet50_transformer
+
+dataset:
+  num_frames: 4
+
+# Override transformer-head dropout without forking the model yaml.
+model:
+  temporal:
+    dropout: 0.10               # ↓ from 0.15
+
+training:
+  optimizer: adamw
+  lr: 5.0e-4
+  weight_decay: 0.02            # ↓ from 0.05
+  batch_size: 16
+  epochs: 150
+  warmup_epochs: 10
+  lr_schedule: cosine
+  label_smoothing: 0.05         # ↓ from 0.10
+  amp: true
+  grad_clip: 1.0
+  num_workers: 8
+  ema: true
+  ema_decay: 0.9995
+  strong_clip_aug: true
+  mixup_alpha: 0.1              # ↓ from 0.2
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp6_tsm_r50_lighter_reg.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: resnet50-tsm-tf-lite-reg
+  tags: [track1, supervised, tsm, resnet50, transformer, ema, ablation]

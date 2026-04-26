@@ -1,0 +1,33 @@
+# @package _global_
+# Exp5 (Track 1): TSM-ResNet50 + 2-layer Transformer (with 2048→512 projection).
+# Trained from scratch with AdamW + EMA. Same data + aug recipe as exp4 but
+# upgraded backbone (R18→R50) and temporal head (mean-pool→Transformer).
+defaults:
+  - override /model: tsm_resnet50_transformer
+
+dataset:
+  num_frames: 4
+
+training:
+  optimizer: adamw
+  lr: 5.0e-4
+  weight_decay: 0.05
+  batch_size: 16              # R50 is ~3× R18; halve from exp4's 32 to keep VRAM safe
+  epochs: 150
+  warmup_epochs: 10           # AdamW + transformer head: longer warmup than exp4's 5
+  lr_schedule: cosine
+  label_smoothing: 0.1
+  amp: true
+  grad_clip: 1.0              # tight clip for transformer-bearing nets
+  num_workers: 8
+  ema: true                   # eval + best-checkpoint use EMA weights
+  ema_decay: 0.9995
+  strong_clip_aug: true       # ConsistentClipAug already uses scale=(0.5, 1.0)
+  mixup_alpha: 0.2
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp5_tsm_r50_transformer.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: resnet50-tsm-tf
+  tags: [track1, supervised, tsm, resnet50, transformer, ema]

@@ -1,0 +1,45 @@
+# @package _global_
+# Track 1: ResNet50-TSM (residual shift) + DualStreamTransformer + MLP, from scratch.
+#
+# Recipe (a) — proven SGD-momentum baseline (matches exp4 spirit, scaled to batch=16):
+#   - SGD + Nesterov, single LR, modest WD (CNN convention, NOT AdamW 0.05).
+#   - Mixup only (no CutMix) — let the model fit before adding more aug.
+#   - drop_path=0.0 — same reason.
+#   - EMA decay=0.999 so val numbers track the live model within ~1-2 epochs.
+#   - bf16 AMP, 5-epoch warmup + cosine, label smoothing, RandAugment+RandomErasing.
+defaults:
+  - override /model: resnet50_tsm_dualstream
+
+dataset:
+  num_frames: 4
+
+# Override the model.yaml's drop_path 0.2 — too aggressive for from-scratch fit.
+model:
+  temporal:
+    drop_path: 0.0
+
+training:
+  optimizer: sgd
+  momentum: 0.9
+  nesterov: true
+  batch_size: 16
+  lr: 5.0e-3                # scaled from exp4's 1e-2 @ batch=32
+  weight_decay: 5.0e-4      # CNN-style WD
+  epochs: 150
+  warmup_epochs: 5
+  label_smoothing: 0.1
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 20.0           # SGD recipe — high clip threshold
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/resnet50_tsm_dualstream.pt
+  device: cuda
+  strong_clip_aug: true
+  mixup_alpha: 0.2
+  cutmix_alpha: 0.0         # disabled for now
+  ema: true
+  ema_decay: 0.999          # short-window EMA so val tracks live model quickly
+
+wandb:
+  enabled: true
+  tags: [track1, supervised, tsm, resnet50, dualstream, sgd]

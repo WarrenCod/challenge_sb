@@ -45,4 +45,5 @@ training:
 
 wandb:
   enabled: true
+  run_name: ibot_cleaned
   tags: [track1, stage1, ibot]
