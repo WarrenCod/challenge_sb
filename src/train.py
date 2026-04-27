@@ -32,7 +32,7 @@ from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from models.cmt import CMT
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
-from models.modular import build_modular_model
+from models.modular import attach_aux_head, build_modular_model
 from utils import (
     ModelEMA,
     atomic_torch_save,
@@ -102,6 +102,7 @@ def train_one_epoch(
     mixup_alpha: float = 0.0,
     cutmix_alpha: float = 0.0,
     ema: Optional[ModelEMA] = None,
+    aux_loss_weight: float = 0.0,
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the training set for one epoch.
 
@@ -112,6 +113,22 @@ def train_one_epoch(
     running_loss = 0.0
     correct = 0
     total = 0
+
+    use_aux = aux_loss_weight > 0.0 and getattr(model, "aux_head", None) is not None
+
+    def _forward_loss(video, y_a, y_b, lam):
+        if use_aux:
+            logits, aux_logits = model.forward_with_aux(video)  # (B,K), (B,T,K)
+            main = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+            B, T, K = aux_logits.shape
+            flat = aux_logits.reshape(B * T, K)
+            ya_rep = y_a.repeat_interleave(T)
+            yb_rep = y_b.repeat_interleave(T)
+            aux = lam * loss_fn(flat, ya_rep) + (1.0 - lam) * loss_fn(flat, yb_rep)
+            return logits, main + aux_loss_weight * aux
+        logits = model(video)
+        loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+        return logits, loss
 
     bar = tqdm(data_loader, desc=f"{epoch_label} train", leave=False, dynamic_ncols=True)
     for video_batch, labels in bar:
@@ -137,8 +154,7 @@ def train_one_epoch(
         stepped = True
         if amp and scaler is not None:
             with autocast(device_type=device.type, dtype=amp_dtype):
-                logits = model(video_batch)
-                loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+                logits, loss = _forward_loss(video_batch, y_a, y_b, lam)
             scaler.scale(loss).backward()
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -151,15 +167,13 @@ def train_one_epoch(
         elif amp:
             # bf16 path: no grad scaler needed.
             with autocast(device_type=device.type, dtype=amp_dtype):
-                logits = model(video_batch)
-                loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+                logits, loss = _forward_loss(video_batch, y_a, y_b, lam)
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         else:
-            logits = model(video_batch)
-            loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+            logits, loss = _forward_loss(video_batch, y_a, y_b, lam)
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -316,6 +330,18 @@ def main(cfg: DictConfig) -> None:
     label_smoothing = float(cfg.training.get("label_smoothing", 0.0))
     loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
+    # Optional per-frame deep-supervision head. Attached on the live model
+    # before EMA so the EMA copy mirrors it (eval still uses main classifier).
+    aux_cfg = cfg.training.get("aux_loss", None)
+    aux_loss_weight = 0.0
+    if aux_cfg is not None and bool(aux_cfg.get("enabled", False)):
+        if cfg.model.name != "modular":
+            raise ValueError("training.aux_loss only supported for model.name=modular")
+        attach_aux_head(model, num_classes=int(cfg.model.num_classes))
+        model.aux_head = model.aux_head.to(device)
+        aux_loss_weight = float(aux_cfg.get("weight", 0.3))
+        print(f"[train] aux per-frame loss enabled (weight={aux_loss_weight})")
+
     amp_enabled = bool(cfg.training.get("amp", False)) and device.type == "cuda"
     amp_dtype_str = str(cfg.training.get("amp_dtype", "fp16")).lower()
     if amp_dtype_str in ("bf16", "bfloat16"):
@@ -452,6 +478,7 @@ def main(cfg: DictConfig) -> None:
             mixup_alpha=mixup_alpha,
             cutmix_alpha=cutmix_alpha,
             ema=ema,
+            aux_loss_weight=aux_loss_weight,
         )
         eval_model = ema.module if ema is not None else model
         val_loss, val_acc = evaluate_epoch(

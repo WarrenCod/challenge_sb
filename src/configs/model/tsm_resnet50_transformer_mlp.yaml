@@ -1,0 +1,25 @@
+# @package _global_
+# TSM-ResNet50 spatial backbone + 2-layer Transformer temporal head with a
+# 2048→512 input projection + 2-layer MLP classifier (Linear→GELU→Dropout→Linear).
+# Same backbone/head as tsm_resnet50_transformer; only the classifier slot
+# changes (linear → mlp). Track 1 (from scratch — no ImageNet weights).
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: resnet_tsm
+    variant: resnet50
+    num_segments: ${dataset.num_frames}
+    fold_div: 8
+    pretrained: false
+  temporal:
+    name: transformer
+    in_proj_dim: 512
+    num_heads: 8
+    num_layers: 2
+    dim_feedforward: 2048
+    dropout: 0.15
+  classifier:
+    name: mlp
+    hidden_dim: 512
+    dropout: 0.3
