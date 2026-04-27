@@ -106,5 +106,62 @@ uv run python src/create_submission.py \
 
 ## Status
 
-Launched **2026-04-27** under `tmux new -s exp2c …`. Results section to be
-appended once training finishes.
+Launched **2026-04-27** under `tmux new -s exp2c …`. Finished the same day
+after ~4h17m on the A5000 (100 epochs × 2250 iters @ ~11 it/s + val).
+
+## Results
+
+**Headline: `val/best_acc = 0.5868`**, reached at epoch 80, vs exp2b's 0.5459
+(at epoch 45). **+4.09 pp** from "schedule + EMA" alone — landing well above
+the 0.555–0.575 conservative band, confirming exp2b was schedule-limited
+rather than capacity-limited.
+
+| metric                 | exp2b        | **exp2c**     | Δ        |
+|------------------------|--------------|---------------|----------|
+| `val/best_acc`         | 0.5459 @ ep 45 | **0.5868 @ ep 80** | +4.09 pp |
+| best-save count        | 36           | **70**        | +34      |
+| final epoch val_acc    | ~0.54        | **0.5837**    | ≈ +4 pp  |
+| final epoch train_acc  | ~0.30        | **0.3916**    | +9 pp    |
+| final epoch val_loss   | n/a          | **1.9753**    | —        |
+| min val_loss epoch     | n/a          | **~ep 60 (1.87)** | —    |
+
+**val/best progression** (every ~10th best-save):
+
+| save # | val_acc |
+|--------|---------|
+| 1      | 0.0706  |
+| 10     | 0.3439  |
+| 20     | 0.4606  |
+| 30     | 0.5094  |
+| 40     | 0.5421  |
+| 50     | 0.5646  |
+| 60     | 0.5811  |
+| 70     | **0.5868** (final) |
+
+The curve keeps moving through the longer schedule — 70 best-saves over 100
+epochs vs 36 over 50 in exp2b means the EMA snapshot improved on roughly
+every other epoch, end-to-end.
+
+**Mild late-stage overfit, not catastrophic.** `val_loss` bottoms at ~1.87
+around epoch 60 and drifts up to 1.97 by epoch 100 (+5%), while `val_acc`
+still creeps up until epoch 80 then plateaus. EMA absorbed most of the
+oscillation — the saved best is effectively the rolling average around the
+peak. No early stopping was needed; the saved best is `≈` the curve's true
+top.
+
+**Submission**: `submissions/exp2c_mae_transformer_submission.csv` (6913 rows),
+inferred via `create_submission.py`.
+
+## Implications for what's next
+
+- exp2b was schedule-limited *and* averaging-limited, by ~4 pp combined.
+  exp2c is the new Stage-2 baseline.
+- The recipe is now "correctly trained" — `train_acc 0.39 < val_acc 0.59`
+  under aug, val_loss curve has a clear bottom, EMA is doing its job. Further
+  Stage-2 improvements have to come from new signal, not from running longer.
+- Cheapest single-axis follow-up identified: add **CutMix** to the recipe
+  (already wired in `train_one_epoch`, just a config knob) and **self-
+  distillation** from this exp2c snapshot. That becomes
+  `exp2d_mae_distill_cutmix` — see `notes/exp2d_mae_distill_cutmix.md`.
+- Larger architectural step still pending: exp3 (iBOT Stage-1 → ViT-S),
+  blocked on the remote pretraining checkpoint.

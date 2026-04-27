@@ -1,0 +1,53 @@
+# @package _global_
+# Exp2d (Track 1): exp2c + CutMix + self-distillation from exp2c.
+# exp2c hit val_best 0.5868 by adding EMA + 2x schedule on top of exp2b.
+# Two single-axis additions vs exp2c, both targeting the supervised stage only:
+#   - cutmix_alpha: 1.0   → alternates 50/50 with mixup_alpha=0.2 in
+#                            train_one_epoch (already wired). Standard ViT
+#                            finetune recipe (DeiT III / MAE / BEiT).
+#   - distill block       → KL divergence from exp2c (frozen, EMA snapshot)
+#                            on the same mixed input. alpha=0.5 splits the
+#                            student loss half hard-CE / half soft-KL.
+#                            T=4.0 follows the DeiT default.
+# Same encoder, same temporal head, same regularization stack as exp2c
+# otherwise (LLRD 0.75, drop_path 0.2, dropout 0.2, label smoothing 0.1,
+# WD 0.05, EMA 0.9999, 100 epochs, warmup 8).
+defaults:
+  - override /model: vit_mae_transformer
+
+model:
+  spatial:
+    drop_path: 0.2
+  temporal:
+    dropout: 0.2
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 16
+  lr: 3.0e-4
+  llrd: 0.75
+  epochs: 100
+  warmup_epochs: 8
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp2d_mae_distill_cutmix.pt
+  device: cuda
+  distill:
+    teacher_ckpt: ${hydra:runtime.cwd}/checkpoints/exp2c_mae_transformer.pt
+    alpha: 0.5
+    temperature: 4.0
+
+wandb:
+  enabled: true
+  run_name: exp2d_mae_distill_cutmix
+  tags: [track1, stage2, mae, transformer, regularized, ema, long, cutmix, distill]

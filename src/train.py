@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional, Tuple
 import hydra
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
@@ -87,6 +88,26 @@ def build_model(cfg: DictConfig) -> nn.Module:
     raise ValueError(f"Unknown model.name: {name}")
 
 
+def load_teacher(checkpoint_path: Path, device: torch.device) -> nn.Module:
+    """Rebuild a frozen teacher from a checkpoint produced by this script.
+
+    The teacher's architecture is taken from the embedded Hydra config in the
+    checkpoint, so it can differ from the student. The model is set to eval()
+    and ``requires_grad_(False)`` so it contributes no gradients and its
+    BN/dropout stay deterministic.
+    """
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if "config" not in ckpt or ckpt["config"] is None:
+        raise ValueError(f"Teacher checkpoint missing 'config': {checkpoint_path}")
+    teacher_cfg = OmegaConf.create(ckpt["config"])
+    teacher = build_model(teacher_cfg)
+    teacher.load_state_dict(ckpt["model_state_dict"])
+    teacher.eval()
+    teacher.requires_grad_(False)
+    teacher.to(device)
+    return teacher
+
+
 def train_one_epoch(
     model: nn.Module,
     data_loader: DataLoader,
@@ -103,6 +124,9 @@ def train_one_epoch(
     cutmix_alpha: float = 0.0,
     ema: Optional[ModelEMA] = None,
     aux_loss_weight: float = 0.0,
+    teacher: Optional[nn.Module] = None,
+    distill_alpha: float = 0.0,
+    distill_temperature: float = 1.0,
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the training set for one epoch.
 
@@ -115,6 +139,7 @@ def train_one_epoch(
     total = 0
 
     use_aux = aux_loss_weight > 0.0 and getattr(model, "aux_head", None) is not None
+    use_distill = teacher is not None and distill_alpha > 0.0
 
     def _forward_loss(video, y_a, y_b, lam):
         if use_aux:
@@ -125,9 +150,18 @@ def train_one_epoch(
             ya_rep = y_a.repeat_interleave(T)
             yb_rep = y_b.repeat_interleave(T)
             aux = lam * loss_fn(flat, ya_rep) + (1.0 - lam) * loss_fn(flat, yb_rep)
-            return logits, main + aux_loss_weight * aux
-        logits = model(video)
-        loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+            loss = main + aux_loss_weight * aux
+        else:
+            logits = model(video)
+            loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+        if use_distill:
+            with torch.no_grad():
+                teacher_logits = teacher(video)
+            tk = distill_temperature
+            student_logp = F.log_softmax(logits / tk, dim=-1)
+            teacher_p = F.softmax(teacher_logits / tk, dim=-1)
+            kl = F.kl_div(student_logp, teacher_p, reduction="batchmean") * (tk * tk)
+            loss = (1.0 - distill_alpha) * loss + distill_alpha * kl
         return logits, loss
 
     bar = tqdm(data_loader, desc=f"{epoch_label} train", leave=False, dynamic_ncols=True)
@@ -461,6 +495,25 @@ def main(cfg: DictConfig) -> None:
     mixup_alpha = float(cfg.training.get("mixup_alpha", 0.0))
     cutmix_alpha = float(cfg.training.get("cutmix_alpha", 0.0))
 
+    # Optional self/cross-distillation: KL between student and a frozen teacher
+    # on the same (already-mixed) input. alpha splits the loss; T softens both
+    # distributions. Teacher is rebuilt from the checkpoint's embedded Hydra cfg.
+    teacher: Optional[nn.Module] = None
+    distill_alpha = 0.0
+    distill_temperature = 1.0
+    distill_cfg = cfg.training.get("distill", None)
+    if distill_cfg is not None and distill_cfg.get("teacher_ckpt", None):
+        teacher_path = Path(str(distill_cfg.teacher_ckpt)).resolve()
+        if not teacher_path.is_file():
+            raise FileNotFoundError(f"distill.teacher_ckpt not found: {teacher_path}")
+        print(f"[train] loading teacher from {teacher_path}")
+        teacher = load_teacher(teacher_path, device)
+        distill_alpha = float(distill_cfg.get("alpha", 0.5))
+        distill_temperature = float(distill_cfg.get("temperature", 4.0))
+        print(
+            f"[train] distillation enabled (alpha={distill_alpha}, T={distill_temperature})"
+        )
+
     for epoch in range(start_epoch, int(cfg.training.epochs)):
         label = f"[{epoch + 1}/{cfg.training.epochs}]"
         train_loss, train_acc = train_one_epoch(
@@ -479,6 +532,9 @@ def main(cfg: DictConfig) -> None:
             cutmix_alpha=cutmix_alpha,
             ema=ema,
             aux_loss_weight=aux_loss_weight,
+            teacher=teacher,
+            distill_alpha=distill_alpha,
+            distill_temperature=distill_temperature,
         )
         eval_model = ema.module if ema is not None else model
         val_loss, val_acc = evaluate_epoch(
