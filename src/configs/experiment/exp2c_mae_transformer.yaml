@@ -1,0 +1,44 @@
+# @package _global_
+# Exp2c (Track 1): exp2b + EMA + 2x schedule.
+# exp2b hit val_best 0.5459 at epoch 45 with the cosine bottoming out and
+# train_loss still drifting down (2.218 -> 2.186 over ep 45-50). Best
+# checkpoint was overwritten 36 times across 50 epochs — the model kept
+# finding small wins until LR ran out. Same encoder, same temporal head,
+# same regularization stack. Two single-axis changes vs exp2b:
+#   - training.ema = true        → ModelEMA (decay 0.9999) is already wired
+#                                   in train.py; saves EMA weights as best.
+#   - epochs 50 -> 100, warmup 5 -> 8 (≈ same warmup ratio).
+defaults:
+  - override /model: vit_mae_transformer
+
+model:
+  spatial:
+    drop_path: 0.2
+  temporal:
+    dropout: 0.2
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 16
+  lr: 3.0e-4
+  llrd: 0.75
+  epochs: 100
+  warmup_epochs: 8
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup_alpha: 0.2
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp2c_mae_transformer.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: exp2c_mae_transformer
+  tags: [track1, stage2, mae, transformer, regularized, ema, long]
