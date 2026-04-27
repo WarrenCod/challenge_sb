@@ -1,0 +1,63 @@
+# @package _global_
+# ibot_transf_3 — third pass on iBOT-Stage1 + temporal transformer (Track 1).
+#
+# v2 (ibot_transf_2) collapsed: val acc stuck at 0.0706 every epoch, train loss
+# barely below uniform (3.37 vs log(33)=3.50) — the head folded onto a single
+# class. v1 (exp3) trained cleanly to 0.302 from the SAME ibot_stage1 checkpoint,
+# so the encoder is fine; the v2 Stage 2 recipe broke it.
+#
+# v3 strategy (highest-impact, lowest-risk slice — see notes/ibot_transf_3.md):
+#   1. LP-FT: spatial trunk frozen for the first 5 epochs, then unfrozen with LLRD.
+#   2. EMA self-distillation: the EMA copy serves as a soft-target teacher (KD α=0.5, T=2).
+#   3. Soft clip-aug preset: narrower RRC, RandAugment m=6, weaker ColorJitter,
+#      RandomErasing p=0.15 — same SSv2-safe contract (no hflip/vflip).
+#   4. CutMix removed entirely (kills motion direction on SSv2).
+#   5. LLRD 0.78 → 0.70 and shorter cosine floor (lr * 0.01 implicit through cosine).
+#
+# Eval target switches to the live student (the EMA is now the teacher, not the eval target).
+defaults:
+  - override /model: vit_mae_transformer
+
+model:
+  spatial:
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/ibot_stage1.pt
+
+dataset:
+  num_frames: 4               # forced: every video on disk has exactly 4 frames
+
+training:
+  batch_size: 32
+  lr: 5.0e-4
+  llrd: 0.70                  # was 0.78 in v2 (which broke), 0.65 in v1
+  epochs: 80
+  warmup_epochs: 5
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+
+  # Augmentation: soft preset (RRC 0.7-1.0, ColorJitter 0.3/0.05, RandAug n=2 m=6, RE p=0.15).
+  aug_strength: soft
+  mixup_alpha: 0.1            # was 0.2 in v2
+  cutmix_alpha: 0.0           # was 1.0 in v2 — kills SSv2 motion direction; off.
+
+  # LP-FT: freeze the spatial trunk while the head warms up.
+  freeze_backbone_epochs: 5
+
+  # EMA + self-distillation. EMA decay 0.999 (was 0.9998 in v2 — too slow).
+  ema: true
+  ema_decay: 0.999
+  distill_alpha: 0.5
+  distill_temperature: 2.0
+  # Eval on the live student, not the teacher (override the legacy default).
+  eval_on_ema: false
+
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/ibot_transf_3.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: ibot_transf_3
+  tags: [track1, stage2, ibot, transformer, v3, lpft, distill]

@@ -351,6 +351,33 @@ def build_strong_clip_transform(image_size: int = 224, use_imagenet_norm: bool =
     return ConsistentClipAug(image_size=image_size, use_imagenet_norm=use_imagenet_norm)
 
 
+def build_soft_clip_transform(image_size: int = 224, use_imagenet_norm: bool = True) -> ConsistentClipAug:
+    """Milder clip-consistent aug for ViT FT on small datasets — narrower RRC,
+    weaker ColorJitter, RandAugment m=6, lower erase prob. No flips (SSv2-safe).
+    """
+    return ConsistentClipAug(
+        image_size=image_size,
+        scale=(0.7, 1.0),
+        ratio=(3 / 4, 4 / 3),
+        brightness=0.3,
+        contrast=0.3,
+        saturation=0.3,
+        hue=0.05,
+        randaug_n=2,
+        randaug_m=6,
+        erase_p=0.15,
+        use_imagenet_norm=use_imagenet_norm,
+    )
+
+
+def set_backbone_frozen(model: nn.Module, frozen: bool) -> None:
+    """Freeze / unfreeze the spatial trunk of a ModularVideoModel for LP-FT."""
+    if not hasattr(model, "spatial"):
+        raise ValueError("set_backbone_frozen expects a model with a `spatial` attribute.")
+    for p in model.spatial.parameters():
+        p.requires_grad_(not frozen)
+
+
 def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float):
     """Sample one Mixup λ per batch; return mixed inputs and (y_a, y_b, λ) for loss.
 

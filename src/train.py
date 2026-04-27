@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional, Tuple
 import hydra
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
@@ -37,6 +38,7 @@ from utils import (
     ModelEMA,
     atomic_torch_save,
     build_llrd_param_groups,
+    build_soft_clip_transform,
     build_strong_clip_transform,
     build_transforms,
     build_two_group_param_groups,
@@ -47,6 +49,7 @@ from utils import (
     make_resume_hash,
     mixup_batch,
     restore_rng_state,
+    set_backbone_frozen,
     set_seed,
     split_train_val,
     wandb_log,
@@ -102,11 +105,18 @@ def train_one_epoch(
     mixup_alpha: float = 0.0,
     cutmix_alpha: float = 0.0,
     ema: Optional[ModelEMA] = None,
+    teacher: Optional[ModelEMA] = None,
+    distill_alpha: float = 0.0,
+    distill_temperature: float = 1.0,
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the training set for one epoch.
 
     With mix augmentation, accuracy is reported against the dominant label of each
     mixed pair (y_a). It's only a rough proxy for training fit; trust val/acc instead.
+
+    When ``teacher`` is provided and ``distill_alpha > 0``, the EMA teacher's softmax
+    is used as a soft target alongside the hard CE loss:
+        loss = (1 - α) * CE_mix + α * T² * KL(softmax(student/T) || softmax(teacher/T))
     """
     model.train()
     running_loss = 0.0
@@ -134,11 +144,27 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
+        kd_active = teacher is not None and distill_alpha > 0.0
+        T = float(distill_temperature)
+
+        def _compose_loss(logits_: torch.Tensor) -> torch.Tensor:
+            ce = lam * loss_fn(logits_, y_a) + (1.0 - lam) * loss_fn(logits_, y_b)
+            if not kd_active:
+                return ce
+            with torch.no_grad():
+                teacher_logits = teacher.module(video_batch)
+            kd = F.kl_div(
+                F.log_softmax(logits_ / T, dim=-1),
+                F.softmax(teacher_logits.float() / T, dim=-1),
+                reduction="batchmean",
+            ) * (T * T)
+            return (1.0 - distill_alpha) * ce + distill_alpha * kd
+
         stepped = True
         if amp and scaler is not None:
             with autocast(device_type=device.type, dtype=amp_dtype):
                 logits = model(video_batch)
-                loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+                loss = _compose_loss(logits)
             scaler.scale(loss).backward()
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -152,14 +178,14 @@ def train_one_epoch(
             # bf16 path: no grad scaler needed.
             with autocast(device_type=device.type, dtype=amp_dtype):
                 logits = model(video_batch)
-                loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+                loss = _compose_loss(logits)
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         else:
             logits = model(video_batch)
-            loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+            loss = _compose_loss(logits)
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -270,11 +296,24 @@ def main(cfg: DictConfig) -> None:
         is_training=False, use_imagenet_norm=use_imagenet_norm
     )
 
-    # Strong clip-aware augmentation (RandomResizedCrop + ColorJitter + RandAugment +
-    # RandomErasing, all consistent across frames). Used when training a temporal model
-    # like TSM where per-frame independent crops would scramble the motion signal.
-    use_strong_aug = bool(cfg.training.get("strong_clip_aug", False))
-    if use_strong_aug:
+    # Strong / soft clip-aware augmentation (RandomResizedCrop + ColorJitter +
+    # RandAugment + RandomErasing, all consistent across frames). The "soft" preset
+    # uses milder ranges — useful for ViT FT on small datasets where the strong
+    # preset can overwhelm the gradient signal.
+    aug_strength = str(cfg.training.get("aug_strength", "")).lower()
+    use_strong_aug = bool(cfg.training.get("strong_clip_aug", False)) or aug_strength == "strong"
+    use_soft_aug = aug_strength == "soft"
+    if use_soft_aug:
+        train_clip_transform = build_soft_clip_transform(
+            image_size=224, use_imagenet_norm=use_imagenet_norm
+        )
+        train_dataset = VideoFrameDataset(
+            root_dir=train_dir,
+            num_frames=int(cfg.dataset.num_frames),
+            clip_transform=train_clip_transform,
+            sample_list=train_samples,
+        )
+    elif use_strong_aug:
         train_clip_transform = build_strong_clip_transform(
             image_size=224, use_imagenet_norm=use_imagenet_norm
         )
@@ -430,8 +469,26 @@ def main(cfg: DictConfig) -> None:
 
     mixup_alpha = float(cfg.training.get("mixup_alpha", 0.0))
     cutmix_alpha = float(cfg.training.get("cutmix_alpha", 0.0))
+    freeze_backbone_epochs = int(cfg.training.get("freeze_backbone_epochs", 0))
+    distill_alpha = float(cfg.training.get("distill_alpha", 0.0))
+    distill_temperature = float(cfg.training.get("distill_temperature", 1.0))
+    # When EMA is used as a distillation teacher, evaluating on it would just
+    # measure the teacher — eval the live student instead. The flag still lets
+    # legacy configs keep eval-on-EMA when no distillation is active.
+    default_eval_on_ema = ema is not None and distill_alpha == 0.0
+    eval_on_ema = bool(cfg.training.get("eval_on_ema", default_eval_on_ema))
+    if distill_alpha > 0.0 and ema is None:
+        raise ValueError("distill_alpha > 0 requires training.ema=true (the EMA acts as the teacher).")
+    if distill_alpha > 0.0:
+        print(f"[train] EMA-teacher distillation enabled (alpha={distill_alpha}, T={distill_temperature})")
+    if freeze_backbone_epochs > 0:
+        print(f"[train] LP-FT: spatial trunk frozen for first {freeze_backbone_epochs} epochs")
 
     for epoch in range(start_epoch, int(cfg.training.epochs)):
+        # LP-FT toggle (idempotent; correct after resume too).
+        set_backbone_frozen(model, frozen=epoch < freeze_backbone_epochs)
+        if epoch == freeze_backbone_epochs and freeze_backbone_epochs > 0:
+            print(f"[train] unfreezing spatial trunk at epoch {epoch + 1}/{cfg.training.epochs}")
         label = f"[{epoch + 1}/{cfg.training.epochs}]"
         train_loss, train_acc = train_one_epoch(
             model,
@@ -448,8 +505,11 @@ def main(cfg: DictConfig) -> None:
             mixup_alpha=mixup_alpha,
             cutmix_alpha=cutmix_alpha,
             ema=ema,
+            teacher=ema if distill_alpha > 0.0 else None,
+            distill_alpha=distill_alpha,
+            distill_temperature=distill_temperature,
         )
-        eval_model = ema.module if ema is not None else model
+        eval_model = ema.module if (ema is not None and eval_on_ema) else model
         val_loss, val_acc = evaluate_epoch(
             eval_model,
             val_loader,
@@ -479,8 +539,9 @@ def main(cfg: DictConfig) -> None:
 
         if val_acc > best_val_accuracy:
             best_val_accuracy = val_acc
-            # When EMA is on, save the EMA weights (those are what just got val'd).
-            best_state_dict = (ema.module if ema is not None else model).state_dict()
+            # Save whichever model was actually evaluated (live student when distill is
+            # on, EMA when EMA is the eval target, plain model otherwise).
+            best_state_dict = eval_model.state_dict()
             payload: Dict[str, Any] = {
                 "model_state_dict": best_state_dict,
                 "model_name": cfg.model.name,
