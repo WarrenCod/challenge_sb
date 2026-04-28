@@ -1,151 +1,165 @@
 """
-V-JEPA model: context encoder + EMA target encoder + predictor.
+V-JEPA Tier-0: frame-pair joint-embedding predictive architecture.
 
-Shapes & conventions
---------------------
-Input video:         ``(B, T, C, H, W)``
-Tubelet grid:        ``(T', H', W') = (T / tubelet_time, H / tubelet_size, W / tubelet_size)``
-Flat token index:    ``i = t * H' * W' + h * W' + w`` (row-major)
+Self-supervised on 4-frame clips. Two ViT-S/16 encoders (context f_theta and
+EMA target f_theta_bar) share architecture. A small predictor g_phi takes the
+context encoder's output for frame i plus a delta-t embedding, and predicts
+the target encoder's patch tokens for frame j.
 
-One mask (context_ids / target_ids) is shared across the batch each step —
-keeps tensor shapes rectangular for speed. Per-sample masking is stronger but
-adds padded-gather bookkeeping not worth it on a single-GPU budget.
+Loss: smooth_L1 in feature space, scale-aligned via parameter-free LayerNorm
+on both prediction and target.
 
-Loss
-----
-``smooth_l1( predictor(context_tokens, target_positions),  LN( target_encoder(video)[target_positions] ) )``
-Target is layer-normed and detached — both are V-JEPA collapse defenses.
+The saved checkpoint stores the EMA target encoder under `encoder_state_dict`
+in the same key layout as MAE / iBOT, so Stage 2 can load it via the existing
+ViTMAEEncoder without renaming.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+import math
+from typing import Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.vision_transformer import Block
 
+from models.mae_vit import PatchEmbed, _sincos_2d_posembed
 
-class TubeletEmbed(nn.Module):
-    """Conv3d patch/tubelet embedding. ``(B, T, C, H, W) -> (B, N, D)``."""
 
-    def __init__(
-        self,
-        num_frames: int,
-        img_size: int,
-        tubelet_time: int,
-        tubelet_size: int,
-        in_chans: int,
-        embed_dim: int,
-    ) -> None:
-        super().__init__()
-        assert num_frames % tubelet_time == 0, "num_frames must divide by tubelet_time"
-        assert img_size % tubelet_size == 0, "img_size must divide by tubelet_size"
-        self.t_grid = num_frames // tubelet_time
-        self.h_grid = img_size // tubelet_size
-        self.w_grid = img_size // tubelet_size
-        self.num_tokens = self.t_grid * self.h_grid * self.w_grid
-        self.proj = nn.Conv3d(
-            in_chans,
-            embed_dim,
-            kernel_size=(tubelet_time, tubelet_size, tubelet_size),
-            stride=(tubelet_time, tubelet_size, tubelet_size),
-        )
-
-    def forward(self, video: torch.Tensor) -> torch.Tensor:
-        # (B, T, C, H, W) -> (B, C, T, H, W) for Conv3d.
-        x = video.permute(0, 2, 1, 3, 4)
-        x = self.proj(x)  # (B, D, T', H', W')
-        return x.flatten(2).transpose(1, 2)  # (B, N, D)
+_VIT_VARIANTS = {
+    "vit_s_16": dict(embed_dim=384, depth=12, num_heads=6, mlp_ratio=4.0, patch_size=16),
+    "vit_ti_16": dict(embed_dim=192, depth=12, num_heads=3, mlp_ratio=4.0, patch_size=16),
+    "vit_b_16": dict(embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.0, patch_size=16),
+}
 
 
 class VJEPAEncoder(nn.Module):
-    """ViT encoder over tubelets, no CLS token."""
+    """ViT-S/16 encoder. Same key layout as ViTMAEEncoder so encoder_state_dict
+    is interchangeable. Forward returns ALL tokens (CLS + patches), unlike
+    ViTMAEEncoder which returns CLS only — V-JEPA needs patch tokens.
+    """
 
     def __init__(
         self,
-        num_frames: int,
-        img_size: int,
-        tubelet_time: int,
-        tubelet_size: int,
-        in_chans: int,
-        embed_dim: int,
-        depth: int,
-        num_heads: int,
-        mlp_ratio: float = 4.0,
+        variant: str = "vit_s_16",
+        image_size: int = 224,
+        drop_path_rate: float = 0.0,
     ) -> None:
         super().__init__()
-        self.patch_embed = TubeletEmbed(
-            num_frames, img_size, tubelet_time, tubelet_size, in_chans, embed_dim
-        )
-        self.num_tokens = self.patch_embed.num_tokens
-        self.t_grid = self.patch_embed.t_grid
-        self.h_grid = self.patch_embed.h_grid
-        self.w_grid = self.patch_embed.w_grid
-        self.embed_dim = embed_dim
+        if variant not in _VIT_VARIANTS:
+            raise ValueError(f"Unknown vit variant {variant}. Options: {list(_VIT_VARIANTS)}")
+        v = _VIT_VARIANTS[variant]
+        self.embed_dim = v["embed_dim"]
+        self.patch_size = v["patch_size"]
 
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
-        self.blocks = nn.ModuleList(
-            [Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True) for _ in range(depth)]
+        self.patch_embed = PatchEmbed(
+            img_size=image_size,
+            patch_size=v["patch_size"],
+            in_chans=3,
+            embed_dim=self.embed_dim,
         )
-        self.norm = nn.LayerNorm(embed_dim)
+        self.num_patches = self.patch_embed.num_patches
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.register_buffer(
+            "pos_embed",
+            _sincos_2d_posembed(self.embed_dim, self.patch_embed.grid_size, cls_token=True),
+            persistent=False,
+        )
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, v["depth"])]
+        self.blocks = nn.ModuleList(
+            [
+                Block(self.embed_dim, v["num_heads"], v["mlp_ratio"], qkv_bias=True, drop_path=dpr[i])
+                for i in range(v["depth"])
+            ]
+        )
+        self.norm = nn.LayerNorm(self.embed_dim)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        w = self.patch_embed.proj.weight.data
+        nn.init.xavier_uniform_(w.view(w.shape[0], -1))
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, frame: torch.Tensor) -> torch.Tensor:
+        """frame: (B, 3, H, W) -> (B, 1+N, D), CLS at index 0."""
+        x = self.patch_embed(frame)                          # (B, N, D)
+        x = x + self.pos_embed[:, 1:, :]
+        cls = self.cls_token + self.pos_embed[:, :1, :]
+        cls = cls.expand(x.shape[0], -1, -1)
+        x = torch.cat([cls, x], dim=1)                       # (B, 1+N, D)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        return x
+
+    def encoder_state_dict(self) -> dict:
+        """State in the layout consumed by ViTMAEEncoder (Stage 2)."""
+        keep_prefixes = ("patch_embed.", "cls_token", "blocks.", "norm.")
+        return {k: v for k, v in self.state_dict().items() if k.startswith(keep_prefixes)}
+
+
+class JEPAPredictor(nn.Module):
+    """Narrow self-attention transformer that predicts target patch embeddings.
+
+    Concatenate-and-self-attend pattern (V-JEPA style):
+      drop CLS -> proj_in(D_enc -> P) -> +delta_t
+      learnable mask queries (mask_token + pos_embed_q + delta_t)
+      concat([context, queries]) -> 4x pre-norm Block -> LN(P) -> proj_out -> readout queries
+    """
+
+    def __init__(
+        self,
+        encoder_dim: int = 384,
+        predictor_dim: int = 128,
+        depth: int = 4,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        num_patches: int = 196,
+        n_dt: int = 6,
+        drop_path_rate: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.encoder_dim = encoder_dim
+        self.predictor_dim = predictor_dim
+        self.num_patches = num_patches
+
+        self.proj_in = nn.Linear(encoder_dim, predictor_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_dim))
+        grid = int(math.sqrt(num_patches))
+        if grid * grid != num_patches:
+            raise ValueError(f"num_patches must be a square; got {num_patches}")
+        self.register_buffer(
+            "pos_embed_q",
+            _sincos_2d_posembed(predictor_dim, grid, cls_token=False),
+            persistent=False,
+        )
+        self.dt_embed = nn.Embedding(n_dt, predictor_dim)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        self.blocks = nn.ModuleList(
+            [
+                Block(predictor_dim, num_heads, mlp_ratio, qkv_bias=True, drop_path=dpr[i])
+                for i in range(depth)
+            ]
+        )
+        self.norm = nn.LayerNorm(predictor_dim)              # final LN before proj_out
+        self.proj_out = nn.Linear(predictor_dim, encoder_dim)
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        w = self.patch_embed.proj.weight
-        nn.init.xavier_uniform_(w.view(w.shape[0], -1))
-        if self.patch_embed.proj.bias is not None:
-            nn.init.zeros_(self.patch_embed.proj.bias)
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def tokenize(self, video: torch.Tensor) -> torch.Tensor:
-        return self.patch_embed(video) + self.pos_embed
-
-    def forward(
-        self, video: torch.Tensor, keep_ids: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        x = self.tokenize(video)  # (B, N, D)
-        if keep_ids is not None:
-            x = x[:, keep_ids, :]
-        for blk in self.blocks:
-            x = blk(x)
-        return self.norm(x)
-
-
-class VJEPAPredictor(nn.Module):
-    """Narrow transformer that fills in target positions from context tokens."""
-
-    def __init__(
-        self,
-        num_tokens: int,
-        encoder_dim: int,
-        pred_dim: int,
-        depth: int,
-        num_heads: int,
-        mlp_ratio: float = 4.0,
-    ) -> None:
-        super().__init__()
-        self.proj_in = nn.Linear(encoder_dim, pred_dim)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, pred_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, pred_dim))
-        self.blocks = nn.ModuleList(
-            [Block(pred_dim, num_heads, mlp_ratio, qkv_bias=True) for _ in range(depth)]
-        )
-        self.norm = nn.LayerNorm(pred_dim)
-        self.proj_out = nn.Linear(pred_dim, encoder_dim)
-
         nn.init.trunc_normal_(self.mask_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.dt_embed.weight, std=0.02)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -155,110 +169,113 @@ class VJEPAPredictor(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(
-        self,
-        context_tokens: torch.Tensor,  # (B, N_ctx, D_enc)
-        context_ids: torch.Tensor,     # (N_ctx,)
-        target_ids: torch.Tensor,      # (N_tgt,)
-    ) -> torch.Tensor:
-        B = context_tokens.size(0)
-        n_tgt = target_ids.numel()
+    def forward(self, z_i: torch.Tensor, dt_idx: torch.Tensor) -> torch.Tensor:
+        """
+        z_i:    (B, 1+N, D_enc) full context-encoder output (CLS + patches).
+        dt_idx: (B,)            integer in {0..n_dt-1}.
 
-        ctx = self.proj_in(context_tokens) + self.pos_embed[:, context_ids, :]
-        tgt = self.mask_token.expand(B, n_tgt, -1) + self.pos_embed[:, target_ids, :]
+        Returns: (B, N, D_enc).
+        """
+        B = z_i.shape[0]
+        N = self.num_patches
+        dt_emb = self.dt_embed(dt_idx)[:, None, :]            # (B, 1, P)
 
-        x = torch.cat([ctx, tgt], dim=1)
+        ctx = self.proj_in(z_i[:, 1:, :])                     # drop CLS -> (B, N, P)
+        ctx = ctx + dt_emb
+
+        q = self.mask_token.expand(B, N, -1)                  # (B, N, P)
+        q = q + self.pos_embed_q + dt_emb
+
+        x = torch.cat([ctx, q], dim=1)                        # (B, 2N, P)
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
-
-        x_tgt = x[:, context_tokens.size(1):, :]
-        return self.proj_out(x_tgt)  # (B, N_tgt, D_enc)
+        x = self.proj_out(x)                                  # (B, 2N, D_enc)
+        return x[:, N:, :]                                    # query positions only
 
 
 class VJEPA(nn.Module):
-    """Context encoder + EMA target encoder + predictor."""
+    """Wrapper: context encoder + EMA target encoder + predictor.
+
+    forward(clip) samples per-sample (i, j) pairs with i != j in {0..T-1},
+    runs the JEPA loss, and returns dict(loss, cos_sim, target_std).
+
+    EMA update is exposed via ema_step(momentum), called after each optim step.
+    """
 
     def __init__(
         self,
-        num_frames: int = 16,
-        img_size: int = 112,
-        tubelet_time: int = 2,
-        tubelet_size: int = 16,
-        in_chans: int = 3,
-        embed_dim: int = 384,
-        depth: int = 12,
-        num_heads: int = 6,
-        mlp_ratio: float = 4.0,
-        predictor_embed_dim: int = 192,
-        predictor_depth: int = 6,
-        predictor_num_heads: int = 6,
+        variant: str = "vit_s_16",
+        image_size: int = 224,
+        predictor_dim: int = 128,
+        predictor_depth: int = 4,
+        predictor_heads: int = 4,
+        num_frames: int = 4,
+        loss_beta: float = 2.0,
     ) -> None:
         super().__init__()
-        enc_kwargs = dict(
-            num_frames=num_frames,
-            img_size=img_size,
-            tubelet_time=tubelet_time,
-            tubelet_size=tubelet_size,
-            in_chans=in_chans,
-            embed_dim=embed_dim,
-            depth=depth,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-        )
-        self.context_encoder = VJEPAEncoder(**enc_kwargs)
-        self.target_encoder = VJEPAEncoder(**enc_kwargs)
+        if num_frames < 2:
+            raise ValueError("num_frames must be >= 2 for frame-pair JEPA")
+        self.num_frames = num_frames
+        self.loss_beta = loss_beta
+
+        self.context_encoder = VJEPAEncoder(variant=variant, image_size=image_size)
+        # Target shares architecture; copy weights and freeze.
+        self.target_encoder = VJEPAEncoder(variant=variant, image_size=image_size)
         self.target_encoder.load_state_dict(self.context_encoder.state_dict())
         for p in self.target_encoder.parameters():
             p.requires_grad = False
 
-        self.predictor = VJEPAPredictor(
-            num_tokens=self.context_encoder.num_tokens,
-            encoder_dim=embed_dim,
-            pred_dim=predictor_embed_dim,
+        encoder_dim = self.context_encoder.embed_dim
+        num_patches = self.context_encoder.num_patches
+        n_dt = 2 * (num_frames - 1)                           # signed dt without 0
+        self.predictor = JEPAPredictor(
+            encoder_dim=encoder_dim,
+            predictor_dim=predictor_dim,
             depth=predictor_depth,
-            num_heads=predictor_num_heads,
-            mlp_ratio=mlp_ratio,
+            num_heads=predictor_heads,
+            num_patches=num_patches,
+            n_dt=n_dt,
         )
 
-    @torch.no_grad()
-    def update_target(self, momentum: float) -> None:
-        for p_ctx, p_tgt in zip(
-            self.context_encoder.parameters(), self.target_encoder.parameters()
-        ):
-            p_tgt.data.mul_(momentum).add_(p_ctx.data, alpha=1.0 - momentum)
-        for b_ctx, b_tgt in zip(
-            self.context_encoder.buffers(), self.target_encoder.buffers()
-        ):
-            b_tgt.data.copy_(b_ctx.data)
+    def forward(self, clip: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """clip: (B, T, 3, H, W). Returns dict(loss, cos_sim, target_std)."""
+        B, T = clip.shape[0], clip.shape[1]
+        device = clip.device
 
-    def forward(
-        self,
-        video: torch.Tensor,         # (B, T, C, H, W)
-        context_ids: torch.Tensor,   # (N_ctx,)
-        target_ids: torch.Tensor,    # (N_tgt,)
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        z_ctx = self.context_encoder(video, keep_ids=context_ids)
-        z_pred = self.predictor(z_ctx, context_ids, target_ids)
+        # Per-sample (i, j), i != j in {0..T-1}: pick j' in {0..T-2}, shift.
+        i = torch.randint(0, T, (B,), device=device)
+        j_prime = torch.randint(0, T - 1, (B,), device=device)
+        j = j_prime + (j_prime >= i).long()
+
+        arange = torch.arange(B, device=device)
+        f_i = clip[arange, i]                                 # (B, 3, H, W)
+        f_j = clip[arange, j]
+
+        dt = j - i                                            # in {-(T-1)..-1, +1..+(T-1)}
+        dt_idx = (dt + (T - 1)) - (dt > 0).long()             # in {0..2(T-1)-1}
+
+        z_i = self.context_encoder(f_i)                       # (B, 1+N, D), grad
+        with torch.no_grad():
+            z_j = self.target_encoder(f_j)                    # (B, 1+N, D)
+            z_target = z_j[:, 1:, :]                          # drop CLS  (B, N, D)
+
+        z_pred = self.predictor(z_i, dt_idx)                  # (B, N, D)
+
+        # Parameter-free LayerNorm on both sides for scale-invariant matching.
+        z_pred_n = F.layer_norm(z_pred, (z_pred.shape[-1],))
+        z_target_n = F.layer_norm(z_target, (z_target.shape[-1],))
+
+        loss = F.smooth_l1_loss(z_pred_n, z_target_n.detach(), beta=self.loss_beta)
 
         with torch.no_grad():
-            z_full = self.target_encoder(video)           # (B, N_total, D)
-            z_tgt = z_full[:, target_ids, :]
-            z_tgt = F.layer_norm(z_tgt, (z_tgt.size(-1),))
-        return z_pred, z_tgt.detach()
+            cos_sim = F.cosine_similarity(z_pred_n, z_target_n, dim=-1).mean()
+            target_std = z_target_n.std(dim=0).mean()
 
-    @staticmethod
-    def loss(z_pred: torch.Tensor, z_tgt: torch.Tensor) -> torch.Tensor:
-        return F.smooth_l1_loss(z_pred, z_tgt)
-
-    # --- checkpoint helpers ---
-
-    def context_encoder_state_dict(self) -> Dict[str, torch.Tensor]:
-        return {k: v for k, v in self.context_encoder.state_dict().items()}
+        return {"loss": loss, "cos_sim": cos_sim.detach(), "target_std": target_std.detach()}
 
     @torch.no_grad()
-    def embedding_std(self, video: torch.Tensor) -> float:
-        """Per-dim std of the context encoder output, averaged. Collapse canary."""
-        z = self.context_encoder(video)          # (B, N, D)
-        z = z.reshape(-1, z.size(-1))
-        return float(z.std(dim=0).mean().item())
+    def ema_step(self, momentum: float) -> None:
+        """theta_bar <- m * theta_bar + (1 - m) * theta on the target encoder."""
+        for pt, pc in zip(self.target_encoder.parameters(), self.context_encoder.parameters()):
+            pt.data.mul_(momentum).add_(pc.data, alpha=1.0 - momentum)

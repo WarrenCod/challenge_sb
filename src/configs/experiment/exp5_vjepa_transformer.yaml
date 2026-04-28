@@ -1,0 +1,36 @@
+# @package _global_
+# Exp5 (Track 1): V-JEPA-pretrained ViT-S + 2-layer temporal transformer head.
+# Same head + data recipe as exp2/exp3; only the spatial encoder's pretraining
+# objective changes. The V-JEPA Stage-1 EMA target encoder dumps weights in the
+# same key layout as MAE/iBOT, so ViTMAEEncoder loads it without modification.
+# LR (5e-4) and LLRD (0.65) match exp3 — V-JEPA features are predictive /
+# contextual rather than pixel-reconstructive, so the gentler recipe used for
+# iBOT applies here. Apples-to-apples vs exp2/exp3 only on the head + data axes.
+defaults:
+  - override /model: vit_mae_transformer
+
+model:
+  spatial:
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1.pt
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 16
+  lr: 5.0e-4                # match exp3: features already abstract
+  llrd: 0.65                # stronger decay preserves more of Stage-1
+  epochs: 50
+  warmup_epochs: 5
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  amp: true
+  grad_clip: 1.0
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp5_vjepa_transformer.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: vjepa_transf_cleaned
+  tags: [track1, stage2, vjepa, transformer]

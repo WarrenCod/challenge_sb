@@ -1,30 +1,28 @@
 """
-V-JEPA self-supervised pretraining on unlabeled video clips.
+Stage 1 — V-JEPA Tier-0 (frame-pair JEPA on 4-frame clips).
 
-Usage (from repo root, in a tmux session so SSH drops don't kill it):
+Per step:
+  - sample one pair (i, j), i != j, per clip
+  - context encoder f_theta on frame i; EMA target encoder f_theta_bar on frame j
+  - narrow predictor g_phi(z_i, delta_t) -> z_hat_j
+  - smooth_L1(LN(z_hat_j), LN(z_j_target).detach())
+  - backprop into f_theta + g_phi; EMA update of f_theta_bar
 
-    tmux new -s vjepa
+Saves the EMA target encoder under `encoder_state_dict` in the same key layout
+as MAE / iBOT, so Stage 2 loads it via the existing ViTMAEEncoder.
+
+Usage:
     python src/pretrain_vjepa.py experiment=vjepa_pretrain
-
-Smoke-test (a handful of steps, one epoch) before the overnight run:
-
-    python src/pretrain_vjepa.py experiment=vjepa_pretrain \\
-        training.epochs=1 training.limit_batches=30
-
-Loss alone doesn't prove SSL worked — watch ``emb_std`` in the log: if it
-collapses toward zero, the representations are trivial. Also run a linear
-probe after training (separate experiment).
 """
 
 from __future__ import annotations
 
-import math
-import random
 import time
 from pathlib import Path
 from typing import Optional
 
 import hydra
+import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
@@ -32,34 +30,23 @@ from torch.amp import autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from dataset.video_ssl_dataset import UnlabeledVideoClipDataset
+from dataset.vjepa_dataset import VJEPAClipAug
+from dataset.video_dataset import VideoFrameDataset
 from models.vjepa import VJEPA
-from models.vjepa_masking import sample_mask
-from utils import set_seed
+from utils import (
+    atomic_torch_save,
+    capture_rng_state,
+    finish_wandb,
+    init_wandb,
+    make_resume_hash,
+    restore_rng_state,
+    set_seed,
+    wandb_log,
+)
 
 
-def build_ssl_transforms(image_size: int):
-    """Light augmentation — JEPA relies on masking, not heavy photometric aug.
-
-    No horizontal flip (SSv2 labels are direction-sensitive). Small colour
-    jitter to reduce low-level shortcut learning.
-    """
-    from torchvision import transforms as T
-
-    return T.Compose(
-        [
-            T.Resize((image_size, image_size)),
-            T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-            T.ToTensor(),
-            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ]
-    )
-
-
-def build_optimizer(
-    model: nn.Module, base_lr: float, weight_decay: float
-) -> torch.optim.Optimizer:
-    """AdamW, no decay on 1-D params / mask_token / pos_embed."""
+def build_optimizer(model: nn.Module, base_lr: float, weight_decay: float) -> torch.optim.Optimizer:
+    """AdamW with no decay on 1-D params (bias, LayerNorm, CLS / mask tokens, pos-embeds)."""
     decay, no_decay = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -67,8 +54,10 @@ def build_optimizer(
         if (
             p.ndim <= 1
             or name.endswith(".bias")
+            or "cls_token" in name
             or "mask_token" in name
             or "pos_embed" in name
+            or "dt_embed" in name
         ):
             no_decay.append(p)
         else:
@@ -80,22 +69,20 @@ def build_optimizer(
     return torch.optim.AdamW(groups, lr=base_lr, betas=(0.9, 0.95))
 
 
-def make_lr_lambda(total_steps: int, warmup_steps: int):
-    def _fn(step: int) -> float:
-        if warmup_steps > 0 and step < warmup_steps:
-            return (step + 1) / warmup_steps
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
-
-    return _fn
-
-
-def ema_momentum(step: int, total_steps: int, m_start: float, m_end: float) -> float:
-    """Cosine schedule from m_start at step 0 to m_end at total_steps."""
-    if total_steps <= 0:
-        return m_end
-    t = min(step / total_steps, 1.0)
-    return m_end - (m_end - m_start) * 0.5 * (1.0 + math.cos(math.pi * t))
+def cosine_schedule(
+    base: float,
+    final: float,
+    n_epochs: int,
+    niter_per_ep: int,
+    warmup_epochs: int = 0,
+    start_warmup: float = 0.0,
+) -> np.ndarray:
+    warmup_iters = warmup_epochs * niter_per_ep
+    total_iters = n_epochs * niter_per_ep
+    warmup = np.linspace(start_warmup, base, warmup_iters) if warmup_iters > 0 else np.array([])
+    iters = np.arange(total_iters - warmup_iters)
+    cosine = final + 0.5 * (base - final) * (1 + np.cos(np.pi * iters / max(1, len(iters))))
+    return np.concatenate([warmup, cosine])
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
@@ -111,17 +98,14 @@ def main(cfg: DictConfig) -> None:
 
     # --- data ---
     train_dir = Path(cfg.dataset.train_dir).resolve()
-    val_dir = Path(cfg.dataset.val_dir).resolve()
-    canonical_classes = {p.name for p in val_dir.iterdir() if p.is_dir()}
-    transform = build_ssl_transforms(image_size=int(cfg.vjepa.image_size))
-
-    dataset = UnlabeledVideoClipDataset(
+    aug = VJEPAClipAug(image_size=int(cfg.vjepa.image_size))
+    dataset = VideoFrameDataset(
         root_dir=train_dir,
         num_frames=int(cfg.vjepa.num_frames),
-        transform=transform,
-        canonical_classes=canonical_classes,
-        seed=int(cfg.dataset.seed),
+        clip_transform=aug,
     )
+    if cfg.dataset.get("max_samples") is not None:
+        dataset.samples = dataset.samples[: int(cfg.dataset.max_samples)]
     print(f"[vjepa] {len(dataset)} clips in {train_dir}")
 
     loader = DataLoader(
@@ -136,169 +120,226 @@ def main(cfg: DictConfig) -> None:
 
     # --- model ---
     model = VJEPA(
-        num_frames=int(cfg.vjepa.num_frames),
-        img_size=int(cfg.vjepa.image_size),
-        tubelet_time=int(cfg.vjepa.tubelet_time),
-        tubelet_size=int(cfg.vjepa.tubelet_size),
-        embed_dim=int(cfg.vjepa.embed_dim),
-        depth=int(cfg.vjepa.depth),
-        num_heads=int(cfg.vjepa.num_heads),
-        mlp_ratio=float(cfg.vjepa.mlp_ratio),
-        predictor_embed_dim=int(cfg.vjepa.predictor_embed_dim),
+        variant=str(cfg.vjepa.variant),
+        image_size=int(cfg.vjepa.image_size),
+        predictor_dim=int(cfg.vjepa.predictor_dim),
         predictor_depth=int(cfg.vjepa.predictor_depth),
-        predictor_num_heads=int(cfg.vjepa.predictor_num_heads),
+        predictor_heads=int(cfg.vjepa.predictor_heads),
+        num_frames=int(cfg.vjepa.num_frames),
+        loss_beta=float(cfg.training.loss_beta),
     ).to(device)
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
     n_total = sum(p.numel() for p in model.parameters()) / 1e6
-    print(
-        f"[vjepa] model = {n_trainable:.1f}M trainable / {n_total:.1f}M total "
-        f"(target encoder frozen)"
-    )
-    print(
-        f"[vjepa] grid = ({model.context_encoder.t_grid}, "
-        f"{model.context_encoder.h_grid}, {model.context_encoder.w_grid}); "
-        f"{model.context_encoder.num_tokens} tokens"
-    )
+    print(f"[vjepa] trainable = {n_train:.1f}M  | total = {n_total:.1f}M")
 
-    # --- optim / sched / amp ---
+    # --- optim / sched ---
     epochs = int(cfg.training.epochs)
-    steps_per_epoch = len(loader)
-    limit_batches: Optional[int] = cfg.training.get("limit_batches", None)
-    if limit_batches is not None:
-        steps_per_epoch = min(steps_per_epoch, int(limit_batches))
-    total_steps = epochs * steps_per_epoch
-    warmup_steps = int(cfg.training.get("warmup_epochs", 0)) * steps_per_epoch
+    n_iter = len(loader)
+    base_lr = float(cfg.training.base_lr) * int(cfg.training.batch_size) / 256.0
+    optimizer = build_optimizer(model, base_lr=base_lr, weight_decay=float(cfg.training.weight_decay))
 
-    batch_size = int(cfg.training.batch_size)
-    base_lr = float(cfg.training.base_lr) * batch_size / 256.0
-    optimizer = build_optimizer(
-        model, base_lr=base_lr, weight_decay=float(cfg.training.weight_decay)
+    lr_sched = cosine_schedule(
+        base=base_lr,
+        final=float(cfg.training.get("final_lr", 1.0e-6)),
+        n_epochs=epochs,
+        niter_per_ep=n_iter,
+        warmup_epochs=int(cfg.training.warmup_epochs),
+        start_warmup=0.0,
     )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, make_lr_lambda(total_steps, warmup_steps)
+    momentum_sched = cosine_schedule(
+        base=float(cfg.training.ema_momentum_start),
+        final=float(cfg.training.ema_momentum_end),
+        n_epochs=epochs,
+        niter_per_ep=n_iter,
     )
 
     amp_enabled = bool(cfg.training.get("amp", True)) and device.type == "cuda"
-    amp_dtype = torch.bfloat16  # bf16: no grad scaler needed, more stable for SSL
+    # bf16 has fp32-equivalent dynamic range (8 exponent bits), so no GradScaler
+    # is needed and overflow → Inf → NaN is not a concern under normal regimes.
+    amp_dtype = torch.bfloat16
 
-    # --- masking RNG ---
-    mask_rng = random.Random(int(cfg.dataset.seed) + 7919)
-    t_grid = model.context_encoder.t_grid
-    h_grid = model.context_encoder.h_grid
-    w_grid = model.context_encoder.w_grid
-
-    # --- ema schedule ---
-    m_start = float(cfg.training.ema_momentum_start)
-    m_end = float(cfg.training.ema_momentum_end)
-
-    # --- misc ---
     ckpt_path = Path(cfg.training.checkpoint_path).resolve()
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_every = int(cfg.training.get("snapshot_every", 10))
-    diag_every = int(cfg.training.get("diag_every", 50))
-    grad_clip = float(cfg.training.get("grad_clip", 0.0))
+    last_path = ckpt_path.with_name(ckpt_path.stem + "_last" + ckpt_path.suffix)
 
-    global_step = 0
-    strat_counts = {"spatial": 0, "temporal": 0}
+    max_nonfinite_streak = int(cfg.training.get("max_nonfinite_streak", 50))
+    es_patience = int(cfg.training.get("early_stop_patience", 25))
+    es_min_delta = float(cfg.training.get("early_stop_min_delta", 1.0e-4))
+    es_min_epochs = int(cfg.training.get("early_stop_min_epochs", 60))
 
-    for epoch in range(epochs):
-        model.context_encoder.train()
-        model.predictor.train()
-        # Target encoder always in eval: no dropout, no stochastic depth.
-        model.target_encoder.eval()
+    init_wandb(cfg, default_run_name=ckpt_path.stem)
 
-        running, seen = 0.0, 0
-        t0 = time.time()
-        bar = tqdm(
-            loader,
-            desc=f"[{epoch + 1}/{epochs}] vjepa",
-            leave=False,
-            dynamic_ncols=True,
-            total=steps_per_epoch,
-        )
-        for step_in_epoch, video in enumerate(bar):
-            if limit_batches is not None and step_in_epoch >= limit_batches:
-                break
-            video = video.to(device, non_blocking=True)
-
-            # Sample one mask for the whole batch (simpler than per-sample padding).
-            context_ids, target_ids, strategy = sample_mask(
-                t_grid,
-                h_grid,
-                w_grid,
-                spatial_ratio=float(cfg.vjepa.spatial_mask_ratio),
-                spatial_n_blocks=int(cfg.vjepa.spatial_mask_n_blocks),
-                temporal_keep_first=int(cfg.vjepa.temporal_keep_first),
-                p_spatial=float(cfg.vjepa.p_spatial),
-                rng=mask_rng,
+    # --- resume ---
+    cfg_hash = make_resume_hash(cfg, keys=("dataset", "training", "vjepa"))
+    start_epoch = 0
+    best_loss = float("inf")
+    epochs_since_improve = 0
+    resume_enabled = bool(cfg.training.get("resume", True))
+    if resume_enabled and last_path.exists():
+        print(f"[vjepa] found resume file: {last_path}")
+        state = torch.load(last_path, map_location=device, weights_only=False)
+        if state.get("cfg_hash") != cfg_hash:
+            raise RuntimeError(
+                f"Resume aborted: config hash mismatch.\n"
+                f"  saved:   {state.get('cfg_hash')}\n"
+                f"  current: {cfg_hash}\n"
+                f"To start fresh, delete {last_path} or pass training.resume=false."
             )
-            strat_counts[strategy] += 1
-            context_ids = context_ids.to(device)
-            target_ids = target_ids.to(device)
+        model.context_encoder.load_state_dict(state["context_encoder"])
+        model.target_encoder.load_state_dict(state["target_encoder"])
+        model.predictor.load_state_dict(state["predictor"])
+        optimizer.load_state_dict(state["optimizer"])
+        start_epoch = int(state["epoch"])
+        best_loss = float(state.get("best_loss", float("inf")))
+        epochs_since_improve = int(state.get("epochs_since_improve", 0))
+        if "rng" in state:
+            restore_rng_state(state["rng"])
+        print(
+            f"[vjepa] resuming from epoch {start_epoch + 1}/{epochs} "
+            f"(best_loss={best_loss:.4f}, no_improve={epochs_since_improve})"
+        )
+    elif not resume_enabled and last_path.exists():
+        print(f"[vjepa] training.resume=false → ignoring {last_path}")
+
+    grad_clip = float(cfg.training.get("grad_clip", 3.0))
+
+    avg_loss: Optional[float] = None
+    nonfinite_streak = 0
+    for epoch in range(start_epoch, epochs):
+        model.train()
+        model.target_encoder.eval()
+        running = {"loss": 0.0, "cos": 0.0, "tgt_std": 0.0}
+        seen = 0
+        nonfinite_this_epoch = 0
+        t0 = time.time()
+        bar = tqdm(loader, desc=f"[{epoch + 1}/{epochs}] vjepa", leave=False, dynamic_ncols=True)
+        for it, batch in enumerate(bar):
+            clip, _ = batch                                   # ignore labels
+            clip = clip.to(device, non_blocking=True)         # (B, T, 3, H, W)
+
+            global_step = epoch * n_iter + it
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr_sched[global_step]
 
             optimizer.zero_grad(set_to_none=True)
-            if amp_enabled:
-                with autocast(device_type=device.type, dtype=amp_dtype):
-                    z_pred, z_tgt = model(video, context_ids, target_ids)
-                    loss = model.loss(z_pred, z_tgt)
-                loss.backward()
-            else:
-                z_pred, z_tgt = model(video, context_ids, target_ids)
-                loss = model.loss(z_pred, z_tgt)
-                loss.backward()
+            with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                out = model(clip)
+                loss = out["loss"]
 
+            # Guard: skip backward + optimizer + EMA on non-finite loss so a
+            # single bad batch can't poison the EMA target encoder permanently.
+            if not torch.isfinite(loss):
+                nonfinite_this_epoch += 1
+                nonfinite_streak += 1
+                if nonfinite_streak >= max_nonfinite_streak:
+                    raise RuntimeError(
+                        f"V-JEPA training aborted: {nonfinite_streak} non-finite steps in a row "
+                        f"(epoch {epoch + 1}, iter {it})."
+                    )
+                continue
+            nonfinite_streak = 0
+
+            loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-            scheduler.step()
+            model.ema_step(float(momentum_sched[global_step]))
 
-            # EMA update for target encoder.
-            m = ema_momentum(global_step, total_steps, m_start, m_end)
-            model.update_target(m)
-
-            running += float(loss.item()) * video.size(0)
-            seen += video.size(0)
-            postfix = {
-                "loss": running / max(1, seen),
-                "lr": optimizer.param_groups[0]["lr"],
-                "ema": m,
-                "mask": strategy[:4],
-            }
-
-            if global_step % diag_every == 0:
-                with torch.no_grad():
-                    emb_std = model.embedding_std(video[:4])
-                postfix["emb_std"] = emb_std
-                if emb_std < 0.01:
-                    tqdm.write(
-                        f"[vjepa][step {global_step}] WARN emb_std={emb_std:.4f} — "
-                        f"possible collapse."
-                    )
-
-            bar.set_postfix(postfix)
-            global_step += 1
+            b = clip.shape[0]
+            running["loss"] += float(loss.item()) * b
+            running["cos"] += float(out["cos_sim"].item()) * b
+            running["tgt_std"] += float(out["target_std"].item()) * b
+            seen += b
+            bar.set_postfix(
+                loss=running["loss"] / max(1, seen),
+                cos=running["cos"] / max(1, seen),
+                lr=optimizer.param_groups[0]["lr"],
+            )
 
         dt = (time.time() - t0) / 60.0
-        avg = running / max(1, seen)
+        avg_loss = running["loss"] / max(1, seen) if seen > 0 else float("nan")
+        avg_cos = running["cos"] / max(1, seen) if seen > 0 else float("nan")
+        avg_tgt = running["tgt_std"] / max(1, seen) if seen > 0 else float("nan")
+        loss_finite = bool(np.isfinite(avg_loss))
+
+        improved = loss_finite and (avg_loss < best_loss - es_min_delta)
+        if improved:
+            best_loss = avg_loss
+            epochs_since_improve = 0
+        else:
+            epochs_since_improve += 1
+
         print(
-            f"Epoch {epoch + 1}/{epochs} | vjepa loss {avg:.4f} | "
-            f"{dt:.2f} min | "
-            f"masks: spatial={strat_counts['spatial']} temporal={strat_counts['temporal']}"
+            f"Epoch {epoch + 1}/{epochs} | loss {avg_loss:.4f} | cos {avg_cos:.4f} "
+            f"| tgt_std {avg_tgt:.4f} | {dt:.2f} min "
+            f"| best {best_loss:.4f} (no_improve={epochs_since_improve}) "
+            f"| nonfinite {nonfinite_this_epoch}"
+        )
+        wandb_log(
+            {
+                "vjepa/loss": avg_loss,
+                "vjepa/cos_sim": avg_cos,
+                "vjepa/target_std": avg_tgt,
+                "vjepa/lr": optimizer.param_groups[0]["lr"],
+                "vjepa/ema_momentum": float(momentum_sched[(epoch + 1) * n_iter - 1]),
+                "vjepa/epoch_minutes": dt,
+                "vjepa/best_loss": best_loss,
+                "vjepa/nonfinite_steps": nonfinite_this_epoch,
+                "epoch": epoch + 1,
+            },
+            step=epoch + 1,
         )
 
-        if (epoch + 1) % snapshot_every == 0 or (epoch + 1) == epochs:
-            torch.save(
+        # Per-epoch resumable snapshot. Skip if the epoch's loss was non-finite,
+        # so a single corrupted epoch can't overwrite a clean resume state.
+        if loss_finite:
+            atomic_torch_save(
                 {
-                    "context_encoder_state_dict": model.context_encoder_state_dict(),
+                    "context_encoder": model.context_encoder.state_dict(),
+                    "target_encoder": model.target_encoder.state_dict(),
+                    "predictor": model.predictor.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch + 1,
+                    "cfg_hash": cfg_hash,
+                    "config": OmegaConf.to_container(cfg, resolve=True),
+                    "rng": capture_rng_state(),
+                    "vjepa_train_loss": avg_loss,
+                    "best_loss": best_loss,
+                    "epochs_since_improve": epochs_since_improve,
+                },
+                last_path,
+            )
+        else:
+            print(f"  Skipping {last_path.name} update (non-finite epoch loss).")
+
+        # Best-by-loss encoder snapshot for Stage 2 (EMA target).
+        if improved:
+            atomic_torch_save(
+                {
+                    "encoder_state_dict": model.target_encoder.encoder_state_dict(),
                     "config": OmegaConf.to_container(cfg, resolve=True),
                     "epoch": epoch + 1,
-                    "vjepa_train_loss": avg,
+                    "vjepa_train_loss": avg_loss,
                 },
                 ckpt_path,
             )
-            print(f"  Saved context encoder to {ckpt_path} (epoch {epoch + 1})")
+            print(f"  New best loss {avg_loss:.4f} → saved target encoder to {ckpt_path}")
 
-    print(f"Done. Final vjepa loss: {avg:.4f}")
+        # Early stop on plateau, gated by a minimum number of epochs so we don't
+        # bail before warmup + the early plateau have settled.
+        if (epoch + 1) >= es_min_epochs and epochs_since_improve >= es_patience:
+            print(
+                f"Early stop at epoch {epoch + 1}: no improvement > {es_min_delta:g} "
+                f"for {epochs_since_improve} epochs (best={best_loss:.4f})."
+            )
+            break
+
+    if avg_loss is None:
+        print(f"Nothing to do: resume position ({start_epoch}) is already at epochs ({epochs}).")
+    else:
+        print(f"Done. Best V-JEPA loss: {best_loss:.4f} | last epoch loss: {avg_loss:.4f}")
+    finish_wandb()
 
 
 if __name__ == "__main__":
