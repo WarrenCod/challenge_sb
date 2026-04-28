@@ -168,8 +168,109 @@ python src/create_submission.py \
 
 ## Status
 
-Launched **2026-04-27** under `tmux new -s exp2d "python src/train.py
+Launched **2026-04-27 21:21** under `tmux new -s exp2d "python src/train.py
 experiment=exp2d_mae_distill_cutmix 2>&1 | tee logs/exp2d_mae_distill_cutmix.log"`.
 Smoke test passed: teacher loaded, distillation log line printed, mixup/cutmix
-alternation works, 1-epoch run finished cleanly. Results section to be
-appended once training finishes.
+alternation works, 1-epoch run finished cleanly. Training completed
+**2026-04-28 03:43** — 100 epochs, ~6h 22min wall-clock on the A5000 (≈1.6×
+exp2c, matching the predicted 1.4–1.7× from the extra teacher forward).
+
+## Results
+
+**Headline: `val/best_acc = 0.6010` at epoch 83**, vs exp2c's `0.5868` at
+epoch 80. **+1.42 pp** from CutMix + self-distillation stacked on top of the
+exp2c recipe — landing right at the **upper edge of the conservative band**
+(0.595–0.610), short of the optimistic ≥ 0.61 threshold by 0.9 pp. Cumulative
+Stage-2 progress is now **+5.51 pp** over exp2b.
+
+| metric                      | exp2b          | exp2c              | **exp2d**            | Δ vs exp2c |
+|-----------------------------|----------------|--------------------|----------------------|------------|
+| `val/best_acc`              | 0.5459 @ ep 45 | 0.5868 @ ep 80     | **0.6010 @ ep 83**   | +1.42 pp   |
+| best-save count             | 36             | 70                 | **61**               | −9         |
+| final epoch val/acc         | ~0.54          | 0.5837             | **0.5978**           | +1.41 pp   |
+| final epoch val/loss        | n/a            | 1.9753             | **1.8777**           | −0.098     |
+| final epoch train/acc (aug) | ~0.30          | 0.3916             | **0.4423**           | +5.07 pp   |
+| min val/loss                | n/a            | ~1.87 @ ep 60      | **1.8422 @ ep 57**   | −0.025     |
+
+**val/best progression** (every ~10th best-save):
+
+| save # | val_acc |
+|--------|---------|
+| 1      | 0.0706  |
+| 10     | 0.3663  |
+| 20     | 0.4943  |
+| 30     | 0.5395  |
+| 40     | 0.5626  |
+| 50     | 0.5820  |
+| 60     | 0.5991  |
+| 61     | **0.6010** (final, ep 83) |
+
+**Curve shape.** val/loss bottoms at **1.8422 around epoch 57** then drifts
+up by +0.04 to 1.8777 by epoch 100, while val/acc keeps creeping up until
+ep 83 then plateaus. Same EMA / soft-target decoupling pattern as exp2c —
+cleaner here (val/loss creep is smaller in absolute and relative terms,
+0.04 vs exp2c's ~0.10), so distillation is regularizing the loss surface
+more effectively than label smoothing alone. **Effective training horizon
+is ~85 epochs**: the final 17 epochs produced zero new bests and only burned
+the cosine-decay tail.
+
+**train_acc went *up*, not down, despite heavier regularization.** exp2c
+finished at 0.3916 train; exp2d finished at 0.4423 (+5.07 pp). With CutMix
+alternating 50/50 with mixup_alpha=0.2 (kept low), the input distribution
+is on average no harder than exp2c's, and the soft-KL targets carry more
+useful gradient than smoothed one-hots — easier optimization step-wise. The
+train < val gap stays healthy (0.44 train < 0.60 val under aug), confirming
+the model is not under-fit.
+
+### Submission
+
+`submissions/exp2d_mae_distill_cutmix_submission.csv` — 6913 rows, predicts
+**32 of 33 classes** (class 27 absent, as expected — never trained). Top
+class share is 6.7% (463/6913, class 30); distribution mode looks similar
+in shape to exp2c, no collapse.
+
+**Test-set top-1 agreement with prior submissions:**
+
+| pair               | agreement | disagreement |
+|--------------------|-----------|--------------|
+| exp2d ↔ exp2c      | 62.0% (4284/6913) | 38.0% |
+| exp2d ↔ exp2b      | 51.6% (3569/6913) | 48.4% |
+
+That **38% disagreement vs exp2c is large** for a +1.42 pp val gain —
+distill+CutMix is not just calibrating exp2c's logits, it is **shifting
+decision boundaries** for thousands of test clips, mostly redistributing
+between neighbouring classes. Implication: leaderboard delta should track
+the val delta (~+1.4 pp) but per-clip ranks change a lot — exp2c→exp2d
+ensembling could be worthwhile if one is needed (different errors, similar
+accuracy).
+
+## Implications for what's next
+
+We hit **0.6010**, in the gray zone the doc pre-registered:
+
+- ✗ `val/best ≤ 0.59` — not triggered.
+- ✓ Clear gain over exp2c (+1.42 pp), but ✗ short of the `≥ 0.61`
+  threshold for exp2e/exp2f ablations.
+
+Practical reads:
+
+- **exp2d is the new Stage-2 baseline.** Recipe (CutMix α=1.0 alternated
+  with mixup α=0.2 + α=0.5/T=4.0 self-distillation) carries forward as
+  the default for any future Stage-2 run.
+- **Architecture is now the priority.** Cumulative +5.51 pp over exp2b has
+  come from training tricks (schedule, EMA, CutMix, distillation) at
+  diminishing per-axis returns (4.09 → 1.42 pp). The next 1+ pp is more
+  likely to come from a better Stage-1 (iBOT vs MAE) or a joint space-time
+  temporal head than from another knob in this loop.
+- **Don't run the exp2e/exp2f ablations yet.** Each is ~6h. With a full
+  iBOT checkpoint due (`checkpoints/ibot_stage1.pt`, blocked on the remote
+  machine), spend GPU time on exp3 instead. If exp3 lands, re-evaluate
+  whether attributing the CutMix vs distillation split is still useful.
+- **Cheap follow-up if needed.** The plateau at ep 83 means a 70- or
+  80-epoch re-run with the same recipe would land within 0.001–0.003 of
+  this number in ~1h less. Worth taking when re-training on top of an
+  iBOT-init for exp3.
+- **Optional ensemble.** exp2c + exp2d disagree on 38% of test clips at
+  similar accuracy — a logit-average submission is an essentially-free
+  way to probe whether the disagreements are complementary or noisy
+  before committing to architecture changes.
