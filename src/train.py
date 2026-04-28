@@ -33,6 +33,7 @@ from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.modular import build_modular_model
 from utils import (
+    ModelEMA,
     atomic_torch_save,
     build_llrd_param_groups,
     build_strong_clip_transform,
@@ -95,6 +96,7 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     epoch_label: str = "",
     mixup_alpha: float = 0.0,
+    ema: Optional[ModelEMA] = None,
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the training set for one epoch.
 
@@ -143,6 +145,8 @@ def train_one_epoch(
 
         if scheduler is not None and stepped:
             scheduler.step()
+        if ema is not None and stepped:
+            ema.update(model)
 
         running_loss += float(loss.item()) * labels.size(0)
         predictions = logits.argmax(dim=1)
@@ -335,6 +339,11 @@ def main(cfg: DictConfig) -> None:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
     scaler = GradScaler(device=device.type) if amp_enabled else None
 
+    ema_decay = float(cfg.training.get("ema_decay", 0.0))
+    ema = ModelEMA(model, decay=ema_decay, device=device) if ema_decay > 0 else None
+    if ema is not None:
+        print(f"[train] EMA enabled (decay={ema_decay})")
+
     best_val_accuracy = 0.0
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
     last_path = checkpoint_path.with_name(checkpoint_path.stem + "_last" + checkpoint_path.suffix)
@@ -360,6 +369,8 @@ def main(cfg: DictConfig) -> None:
         scheduler.load_state_dict(state["scheduler"])
         if scaler is not None and state.get("scaler") is not None:
             scaler.load_state_dict(state["scaler"])
+        if ema is not None and state.get("ema") is not None:
+            ema.load_state_dict(state["ema"])
         start_epoch = int(state["epoch"])
         best_val_accuracy = float(state.get("best_val_accuracy", 0.0))
         if "rng" in state:
@@ -384,9 +395,11 @@ def main(cfg: DictConfig) -> None:
             grad_clip=grad_clip,
             epoch_label=label,
             mixup_alpha=mixup_alpha,
+            ema=ema,
         )
+        eval_model = ema.module if ema is not None else model
         val_loss, val_acc = evaluate_epoch(
-            model, val_loader, loss_fn, device, amp=amp_enabled, epoch_label=label
+            eval_model, val_loader, loss_fn, device, amp=amp_enabled, epoch_label=label
         )
 
         print(
@@ -409,7 +422,9 @@ def main(cfg: DictConfig) -> None:
         if val_acc > best_val_accuracy:
             best_val_accuracy = val_acc
             payload: Dict[str, Any] = {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": (
+                    ema.module.state_dict() if ema is not None else model.state_dict()
+                ),
                 "model_name": cfg.model.name,
                 "num_classes": int(cfg.model.num_classes),
                 "pretrained": use_imagenet_norm,
@@ -434,6 +449,7 @@ def main(cfg: DictConfig) -> None:
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict() if scaler is not None else None,
+                "ema": ema.state_dict() if ema is not None else None,
                 "epoch": epoch + 1,
                 "cfg_hash": cfg_hash,
                 "config": OmegaConf.to_container(cfg, resolve=True),

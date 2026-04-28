@@ -124,28 +124,25 @@ def run_inference(
     loader: DataLoader,
     device: torch.device,
     total_videos: int,
-) -> List[int]:
-    """Run the model on the loader; print batch progress to stdout."""
+    tag: str = "",
+) -> torch.Tensor:
+    """Run a single forward pass over the loader; return softmax probs (N, K)."""
     model.eval()
-    preds: List[int] = []
     n_batches = len(loader)
-    # About 10 progress lines for long runs; at least every batch if tiny
     log_interval = max(1, n_batches // 10)
     processed = 0
+    chunks: List[torch.Tensor] = []
     for batch_idx, (video_batch, _labels) in enumerate(loader, start=1):
         video_batch = video_batch.to(device)
         logits = model(video_batch)
-        batch_pred = logits.argmax(dim=1).cpu().tolist()
-        preds.extend(int(p) for p in batch_pred)
-        bs = video_batch.size(0)
-        processed += bs
+        chunks.append(logits.softmax(dim=1).cpu())
+        processed += video_batch.size(0)
         if batch_idx % log_interval == 0 or batch_idx == n_batches:
             print(
-                f"  Inference batch {batch_idx}/{n_batches} "
-                f"({processed}/{total_videos} clips)",
+                f"  {tag}batch {batch_idx}/{n_batches} ({processed}/{total_videos} clips)",
                 flush=True,
             )
-    return preds
+    return torch.cat(chunks, dim=0)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
@@ -201,27 +198,47 @@ def main(cfg: DictConfig) -> None:
         )
     sample_list: List[Tuple[Path, int]] = [(p, 0) for p in video_dirs]
 
-    dataset = VideoFrameDataset(
-        root_dir=test_root,
-        num_frames=num_frames,
-        transform=eval_transform,
-        sample_list=sample_list,
-    )
-    batch_size = int(cfg.training.batch_size)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=int(cfg.training.num_workers),
-        pin_memory=(device.type == "cuda"),
-    )
+    # Multi-clip TTA: average softmax probs across N temporally-jittered samplings.
+    tta_offsets_cfg = cfg.dataset.get("tta_offsets")
+    if tta_offsets_cfg is None or len(list(tta_offsets_cfg)) == 0:
+        tta_offsets = [0.0]
+    else:
+        tta_offsets = [float(x) for x in tta_offsets_cfg]
+    print(f"TTA temporal offsets: {tta_offsets}", flush=True)
 
-    print(
-        f"Starting inference: {len(dataset)} clips, batch_size={batch_size}, "
-        f"{len(loader)} batches",
-        flush=True,
-    )
-    predictions = run_inference(model, loader, device, total_videos=len(dataset))
+    batch_size = int(cfg.training.batch_size)
+    accumulated: torch.Tensor | None = None
+    for i, off in enumerate(tta_offsets):
+        dataset = VideoFrameDataset(
+            root_dir=test_root,
+            num_frames=num_frames,
+            transform=eval_transform,
+            sample_list=sample_list,
+            frame_offset=off,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=int(cfg.training.num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
+        print(
+            f"[TTA {i + 1}/{len(tta_offsets)}, offset={off:+.2f}] "
+            f"{len(dataset)} clips, batch_size={batch_size}, {len(loader)} batches",
+            flush=True,
+        )
+        probs = run_inference(
+            model,
+            loader,
+            device,
+            total_videos=len(dataset),
+            tag=f"[off={off:+.2f}] ",
+        )
+        accumulated = probs if accumulated is None else accumulated + probs
+    assert accumulated is not None
+    accumulated /= float(len(tta_offsets))
+    predictions = accumulated.argmax(dim=1).tolist()
     print("Inference finished.", flush=True)
 
     if len(predictions) != len(video_names):

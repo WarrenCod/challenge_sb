@@ -12,3 +12,7 @@ dataset:
   val_ratio: 0.2
   seed: 42
   max_samples: null
+  # Test-time augmentation for create_submission.py: list of temporal offsets
+  # (in fractions of a frame-step) to average. Default [0.0] = no TTA.
+  # Example: [-0.5, 0.0, 0.5] for 3-clip averaging.
+  tta_offsets: [0.0]

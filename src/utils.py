@@ -419,6 +419,56 @@ def capture_rng_state() -> dict:
     }
 
 
+class ModelEMA:
+    """Exponential-moving-average shadow of a model's parameters and buffers.
+
+    Use with `update(model)` after each optimizer step; evaluate on `module`.
+    Saves are tied to `module.state_dict()` so checkpoints behave identically
+    to a normal model. Decay schedule warms up: early steps move fast (so EMA
+    catches up to a freshly-initialised model) then settles to ``decay``.
+    """
+
+    def __init__(
+        self,
+        model: "torch.nn.Module",
+        decay: float = 0.9999,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        import copy
+
+        self.module = copy.deepcopy(model).eval()
+        for p in self.module.parameters():
+            p.requires_grad_(False)
+        if device is not None:
+            self.module.to(device)
+        self.decay = decay
+        self.num_updates = 0
+
+    @torch.no_grad()
+    def update(self, model: "torch.nn.Module") -> None:
+        self.num_updates += 1
+        # Warmup factor: matches the timm convention (avoid copying noise early on).
+        d = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        msd = model.state_dict()
+        for k, v in self.module.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(d).add_(msd[k].detach(), alpha=1.0 - d)
+            else:
+                v.copy_(msd[k])
+
+    def state_dict(self) -> dict:
+        return {
+            "module": self.module.state_dict(),
+            "decay": self.decay,
+            "num_updates": self.num_updates,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.module.load_state_dict(state["module"])
+        self.decay = state.get("decay", self.decay)
+        self.num_updates = int(state.get("num_updates", 0))
+
+
 def restore_rng_state(state: dict) -> None:
     """Inverse of capture_rng_state. Tolerates missing fields and map_location moves."""
     if "torch" in state:

@@ -1,4 +1,41 @@
 # @package _global_
-# Modular experiment: ViT-S/16 spatial + Transformer temporal + MLP head, from scratch.
+# Modular Track-1 recipe: ViT-S/16 (scratch) -> 4-layer Transformer -> MLP head.
+#
+# Recipe rationale (no ImageNet allowed):
+#   - num_frames=8: SSv2-style classes are direction/sequence sensitive; 4 frames was too thin.
+#   - strong_clip_aug: RandomResizedCrop(0.5,1.0) + ColorJitter + RandAugment(2,9) + RandomErasing,
+#     replayed identically across all frames (so motion stays coherent). NO hflip — labels
+#     are direction-sensitive.
+#   - mixup α=0.2 + label_smoothing 0.1: small but standard reg combo.
+#   - AdamW, lr 5e-4, wd 0.05: scratch ViT recipe (DeiT-like).
+#   - 5 warmup epochs + cosine over 50 total: scratch ViTs need long schedules.
+#   - grad_clip 1.0: ViT-from-scratch is unstable in early epochs.
+#   - AMP fp16: A5000 24 GB; halves memory and ~doubles throughput.
+#   - EMA decay 0.9999: free regularisation; checkpoint saves the EMA copy.
 defaults:
   - override /model: vit_transformer_mlp
+
+dataset:
+  num_frames: 8
+
+training:
+  batch_size: 16
+  num_workers: 8
+  lr: 0.0003                 # 3e-4: conservative for ViT-from-scratch at bs=16
+  epochs: 60                 # scratch ViT needs longer; cosine settles smoothly with EMA
+  weight_decay: 0.05
+  warmup_epochs: 5
+  grad_clip: 1.0
+  amp: true
+  optimizer: adamw
+  mixup_alpha: 0.2
+  label_smoothing: 0.1
+  strong_clip_aug: true
+  ema_decay: 0.9999
+  checkpoint_path: ${hydra:runtime.cwd}/best_vit_transformer_mlp.pt
+
+wandb:
+  enabled: true
+  project: csc43m04ep
+  run_name: vit-transf
+  tags: [track1, scratch, vit_s16, modular]
