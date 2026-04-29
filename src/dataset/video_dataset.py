@@ -81,10 +81,19 @@ def collect_video_samples(root_dir: Path) -> List[Tuple[Path, int]]:
     return samples
 
 
-def _pick_frame_indices(num_available: int, num_frames: int) -> List[int]:
+def _pick_frame_indices(
+    num_available: int,
+    num_frames: int,
+    offset_fraction: float = 0.0,
+) -> List[int]:
     """
     Evenly spaced indices in [0, num_available - 1], inclusive.
     If fewer frames than requested, indices may repeat (last frame duplicated).
+
+    offset_fraction in [0, 1) shifts every linspace position by that fraction of
+    one inter-frame step (clamped into the valid range). Used by inference-time
+    multi-clip TTA: averaging predictions over N evenly shifted offsets recovers
+    information the fixed linspace throws away.
     """
     if num_available <= 0:
         raise ValueError("Video has no frames.")
@@ -96,6 +105,10 @@ def _pick_frame_indices(num_available: int, num_frames: int) -> List[int]:
 
     # linspace in index space
     positions = torch.linspace(0, num_available - 1, steps=num_frames)
+    if offset_fraction != 0.0 and num_frames > 1:
+        step = (num_available - 1) / (num_frames - 1)
+        positions = positions + offset_fraction * step
+    positions = positions.clamp(min=0.0, max=float(num_available - 1))
     indices = [int(round(float(x))) for x in positions]
     return indices
 
@@ -108,6 +121,7 @@ class VideoFrameDataset(Dataset):
         transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
         sample_list: Optional[List[Tuple[Path, int]]] = None,
         clip_transform: Optional[Callable[[List[Image.Image]], torch.Tensor]] = None,
+        frame_offset_fraction: float = 0.0,
     ) -> None:
         """
         Args:
@@ -127,6 +141,7 @@ class VideoFrameDataset(Dataset):
         self.num_frames = num_frames
         self.transform = transform
         self.clip_transform = clip_transform
+        self.frame_offset_fraction = float(frame_offset_fraction)
 
         if sample_list is None:
             self.samples = collect_video_samples(self.root_dir)
@@ -139,7 +154,9 @@ class VideoFrameDataset(Dataset):
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         video_dir, label = self.samples[index]
         frame_paths = _list_frame_paths(video_dir)
-        indices = _pick_frame_indices(len(frame_paths), self.num_frames)
+        indices = _pick_frame_indices(
+            len(frame_paths), self.num_frames, offset_fraction=self.frame_offset_fraction
+        )
 
         pil_frames: List[Image.Image] = []
         for frame_index in indices:

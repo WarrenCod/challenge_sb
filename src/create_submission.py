@@ -148,6 +148,40 @@ def run_inference(
     return preds
 
 
+@torch.no_grad()
+def accumulate_softmax(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    total_videos: int,
+    num_classes: int,
+    label: str,
+) -> torch.Tensor:
+    """Run inference and return summed softmax (B_total, num_classes) on CPU.
+
+    Used by multi-clip TTA: caller calls this once per temporal offset and
+    averages the accumulated softmax before argmaxing.
+    """
+    model.eval()
+    out = torch.zeros(total_videos, num_classes, dtype=torch.float32)
+    cursor = 0
+    n_batches = len(loader)
+    log_interval = max(1, n_batches // 5)
+    for batch_idx, (video_batch, _labels) in enumerate(loader, start=1):
+        video_batch = video_batch.to(device)
+        logits = model(video_batch)
+        probs = logits.softmax(dim=1).cpu()
+        bs = probs.size(0)
+        out[cursor : cursor + bs] = probs
+        cursor += bs
+        if batch_idx % log_interval == 0 or batch_idx == n_batches:
+            print(
+                f"  [{label}] batch {batch_idx}/{n_batches} ({cursor}/{total_videos})",
+                flush=True,
+            )
+    return out
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
@@ -173,7 +207,12 @@ def main(cfg: DictConfig) -> None:
 
     num_frames = int(ckpt.get("num_frames", cfg.dataset.num_frames))
     pretrained = bool(ckpt.get("pretrained", cfg.model.get("pretrained", False)))
-    eval_transform = build_transforms(is_training=False, use_imagenet_norm=pretrained)
+    saved_cfg = ckpt.get("config") or {}
+    saved_dataset = saved_cfg.get("dataset", {}) if isinstance(saved_cfg, dict) else {}
+    image_size = int(saved_dataset.get("image_size", cfg.dataset.get("image_size", 224)))
+    eval_transform = build_transforms(
+        image_size=image_size, is_training=False, use_imagenet_norm=pretrained
+    )
 
     test_root = Path(cfg.dataset.test_dir).resolve()
     output_path = Path(cfg.dataset.submission_output).resolve()
@@ -200,28 +239,69 @@ def main(cfg: DictConfig) -> None:
             flush=True,
         )
     sample_list: List[Tuple[Path, int]] = [(p, 0) for p in video_dirs]
-
-    dataset = VideoFrameDataset(
-        root_dir=test_root,
-        num_frames=num_frames,
-        transform=eval_transform,
-        sample_list=sample_list,
-    )
     batch_size = int(cfg.training.batch_size)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=int(cfg.training.num_workers),
-        pin_memory=(device.type == "cuda"),
-    )
+    tta_clips = int(cfg.training.get("tta_clips", 1))
+    if tta_clips < 1:
+        raise ValueError(f"training.tta_clips must be >=1, got {tta_clips}")
 
-    print(
-        f"Starting inference: {len(dataset)} clips, batch_size={batch_size}, "
-        f"{len(loader)} batches",
-        flush=True,
-    )
-    predictions = run_inference(model, loader, device, total_videos=len(dataset))
+    if tta_clips == 1:
+        dataset = VideoFrameDataset(
+            root_dir=test_root,
+            num_frames=num_frames,
+            transform=eval_transform,
+            sample_list=sample_list,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=int(cfg.training.num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
+        print(
+            f"Starting inference: {len(dataset)} clips, batch_size={batch_size}, "
+            f"{len(loader)} batches",
+            flush=True,
+        )
+        predictions = run_inference(model, loader, device, total_videos=len(dataset))
+    else:
+        # Multi-clip TTA: N evenly spaced sub-bin offsets, average softmax.
+        # Offsets are -0.5..+0.5 of one inter-frame step (centered around 0 for
+        # symmetry), so N=4 gives offsets {-0.375, -0.125, 0.125, 0.375}.
+        num_classes = int(ckpt.get("num_classes"))
+        offsets = [(-0.5 + (k + 0.5) / tta_clips) for k in range(tta_clips)]
+        print(
+            f"TTA over {tta_clips} temporal clips (offsets={[round(o, 3) for o in offsets]}); "
+            f"batch_size={batch_size}",
+            flush=True,
+        )
+        accum: torch.Tensor | None = None
+        for i, off in enumerate(offsets):
+            dataset = VideoFrameDataset(
+                root_dir=test_root,
+                num_frames=num_frames,
+                transform=eval_transform,
+                sample_list=sample_list,
+                frame_offset_fraction=off,
+            )
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=int(cfg.training.num_workers),
+                pin_memory=(device.type == "cuda"),
+            )
+            probs = accumulate_softmax(
+                model,
+                loader,
+                device,
+                total_videos=len(dataset),
+                num_classes=num_classes,
+                label=f"clip {i + 1}/{tta_clips} off={off:+.3f}",
+            )
+            accum = probs if accum is None else (accum + probs)
+        assert accum is not None
+        predictions = accum.argmax(dim=1).tolist()
     print("Inference finished.", flush=True)
 
     if len(predictions) != len(video_names):

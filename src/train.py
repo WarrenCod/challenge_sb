@@ -276,11 +276,12 @@ def main(cfg: DictConfig) -> None:
         use_imagenet_norm = bool(cfg.model.spatial.get("pretrained", False))
     else:
         use_imagenet_norm = bool(cfg.model.get("pretrained", False))
+    image_size = int(cfg.dataset.get("image_size", 224))
     train_transform = build_transforms(
-        is_training=True, use_imagenet_norm=use_imagenet_norm
+        image_size=image_size, is_training=True, use_imagenet_norm=use_imagenet_norm
     )
     eval_transform = build_transforms(
-        is_training=False, use_imagenet_norm=use_imagenet_norm
+        image_size=image_size, is_training=False, use_imagenet_norm=use_imagenet_norm
     )
 
     # Strong clip-aware augmentation (RandomResizedCrop + ColorJitter + RandAugment +
@@ -289,7 +290,7 @@ def main(cfg: DictConfig) -> None:
     use_strong_aug = bool(cfg.training.get("strong_clip_aug", False))
     if use_strong_aug:
         train_clip_transform = build_strong_clip_transform(
-            image_size=224, use_imagenet_norm=use_imagenet_norm
+            image_size=image_size, use_imagenet_norm=use_imagenet_norm
         )
         train_dataset = VideoFrameDataset(
             root_dir=train_dir,

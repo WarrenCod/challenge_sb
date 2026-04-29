@@ -53,6 +53,7 @@ class TemporalShift(nn.Module):
 _RESNET_FACTORIES = {
     "resnet18": (models.resnet18, models.ResNet18_Weights.IMAGENET1K_V1),
     "resnet50": (models.resnet50, models.ResNet50_Weights.IMAGENET1K_V2),
+    "resnet101": (models.resnet101, models.ResNet101_Weights.IMAGENET1K_V2),
 }
 
 

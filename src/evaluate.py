@@ -61,7 +61,13 @@ def main(cfg: DictConfig) -> None:
 
     # Normalization must match how the checkpoint was trained (ImageNet stats if pretrained).
     pretrained_used = bool(raw.get("pretrained", cfg.model.get("pretrained", False)))
-    eval_transform = build_transforms(is_training=False, use_imagenet_norm=pretrained_used)
+    # Image size must also match the trained config (256 vs 224 changes feature scale).
+    saved_cfg = raw.get("config") or {}
+    saved_dataset = saved_cfg.get("dataset", {}) if isinstance(saved_cfg, dict) else {}
+    image_size = int(saved_dataset.get("image_size", cfg.dataset.get("image_size", 224)))
+    eval_transform = build_transforms(
+        image_size=image_size, is_training=False, use_imagenet_norm=pretrained_used
+    )
 
     val_dir = Path(cfg.dataset.val_dir).resolve()
     val_samples = collect_video_samples(val_dir)
