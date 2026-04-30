@@ -10,7 +10,7 @@ dataset:
 
 training:
   batch_size: 16
-  lr: 1.0e-3
+  lr: 3.0e-4              # lowered from 1e-3: 1e-3 caused divergence at epoch 5
   llrd: 0.75
   epochs: 50
   warmup_epochs: 5
@@ -24,5 +24,5 @@ training:
 
 wandb:
   enabled: true
-  run_name: mae_transf_cleaned
+  run_name: mae_transf_2
   tags: [track1, stage2, mae, transformer]

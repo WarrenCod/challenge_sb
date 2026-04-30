@@ -14,6 +14,11 @@ class LinearClassifier(Classifier):
         self.in_dim = in_dim
         self.num_classes = num_classes
         self.fc = nn.Linear(in_dim, num_classes)
+        # Zero-init: first forward outputs uniform logits → CE loss = log(num_classes)
+        # cleanly. Avoids spurious early gradients from random classifier weights
+        # that would propagate noise back into the (pretrained) encoder.
+        nn.init.zeros_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
 
     def forward(self, vec: torch.Tensor) -> torch.Tensor:
         return self.fc(vec)

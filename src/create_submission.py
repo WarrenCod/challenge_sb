@@ -172,7 +172,7 @@ def main(cfg: DictConfig) -> None:
     print(f"Model on device: {device}", flush=True)
 
     num_frames = int(ckpt.get("num_frames", cfg.dataset.num_frames))
-    pretrained = bool(ckpt.get("pretrained", cfg.model.pretrained))
+    pretrained = bool(ckpt.get("pretrained", cfg.model.get("pretrained", False)))
     eval_transform = build_transforms(is_training=False, use_imagenet_norm=pretrained)
 
     test_root = Path(cfg.dataset.test_dir).resolve()

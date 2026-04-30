@@ -31,6 +31,7 @@ from models.spatial.resnet_tsm import ResNetTSMEncoder
 from models.spatial.vit import ViTEncoder
 from models.spatial.vit_mae import ViTMAEEncoder
 from models.temporal.diff_transformer import DiffTransformerTemporal
+from models.temporal.dual_stream_transformer import DualStreamTransformerTemporal
 from models.temporal.lstm import LSTMTemporal
 from models.temporal.mean_pool import MeanPoolTemporal
 from models.temporal.transformer import TransformerTemporal
@@ -54,6 +55,7 @@ TEMPORAL_REGISTRY: Dict[str, type] = {
     "lstm": LSTMTemporal,
     "transformer": TransformerTemporal,
     "diff_transformer": DiffTransformerTemporal,
+    "dual_stream_transformer": DualStreamTransformerTemporal,
 }
 CLASSIFIER_REGISTRY: Dict[str, type] = {
     "linear": LinearClassifier,
@@ -84,11 +86,39 @@ class ModularVideoModel(nn.Module):
         self.spatial = spatial
         self.temporal = temporal
         self.classifier = classifier
+        self.aux_head: nn.Module | None = None  # optional per-frame deep-supervision head
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
         frame_features = self.spatial(video)       # (B, T, d)
         video_vector = self.temporal(frame_features)  # (B, d')
         return self.classifier(video_vector)       # (B, num_classes)
+
+    def forward_with_aux(self, video: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Returns (main_logits (B, K), aux_logits (B, T, K)).
+        # Only valid when self.aux_head is set; train.py guards the call.
+        frame_features = self.spatial(video)            # (B, T, d)
+        video_vector = self.temporal(frame_features)    # (B, d')
+        main_logits = self.classifier(video_vector)     # (B, K)
+        aux_logits = self.aux_head(frame_features)      # (B, T, K)
+        return main_logits, aux_logits
+
+
+class AuxFrameHead(nn.Module):
+    """Per-frame linear classifier on (B, T, d) spatial features → (B, T, K).
+
+    Used as deep supervision: feeds CE gradient into every frame of the
+    backbone, separate from the temporal-aggregated main loss. Lightweight
+    (one Linear); shares no params with the main classifier.
+    """
+
+    def __init__(self, in_dim: int, num_classes: int) -> None:
+        super().__init__()
+        self.fc = nn.Linear(in_dim, num_classes)
+        nn.init.zeros_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+
+    def forward(self, frame_features: torch.Tensor) -> torch.Tensor:
+        return self.fc(frame_features)
 
 
 def _to_plain(cfg: Mapping[str, Any]) -> Dict[str, Any]:
@@ -146,3 +176,10 @@ def build_modular_model(
         cfg["classifier"], in_dim=temporal.out_dim, num_classes=num_classes
     )
     return ModularVideoModel(spatial=spatial, temporal=temporal, classifier=classifier)
+
+
+def attach_aux_head(model: ModularVideoModel, num_classes: int) -> AuxFrameHead:
+    """Attach a per-frame deep-supervision head; mutates model in place."""
+    head = AuxFrameHead(in_dim=model.spatial.out_dim, num_classes=num_classes)
+    model.aux_head = head
+    return head

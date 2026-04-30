@@ -1,0 +1,49 @@
+# @package _global_
+# Exp7 (Track 1): exp5 reg recipe + capacity-side improvements + longer cosine.
+#
+# Why: exp6 lightened reg and underfit (best val 0.4857 vs exp5 0.5797). The
+# bottleneck is backbone optimization & head capacity, not regularization. exp7
+# keeps every reg knob at the exp5 setting and changes four other axes:
+#   1. classifier:  linear -> 2-layer MLP (hidden=512, dropout=0.3)
+#   2. optimizer:   single LR -> 2-group  (backbone 2e-4, head 5e-4)
+#   3. aux loss:    per-frame CE on spatial features (weight 0.3, label_smooth=0.1)
+#   4. schedule:    150 ep / 10 warmup -> 220 ep / 15 warmup (cosine half-life shifts right)
+#
+# Single-axis ablations off exp5 stay possible; this one bundles 4 changes
+# because each is small and they don't interact destructively (head capacity,
+# LR groups, aux supervision, schedule are orthogonal). If exp7 wins, future
+# ablations can peel them back to attribute.
+
+defaults:
+  - override /model: tsm_resnet50_transformer_mlp
+
+dataset:
+  num_frames: 4
+
+training:
+  optimizer: adamw
+  lr: 5.0e-4               # head LR (temporal + classifier + aux head)
+  backbone_lr: 2.0e-4      # spatial.* group; build_two_group_param_groups picks this up
+  weight_decay: 0.05       # exp5 value, unchanged
+  batch_size: 16
+  epochs: 220              # +47% over exp5; cosine half-life moves from ~ep 75 to ~ep 110
+  warmup_epochs: 15        # +5 over exp5; MLP head + 2 LR groups need a longer ramp
+  lr_schedule: cosine
+  label_smoothing: 0.1     # exp5 value, unchanged
+  amp: true
+  grad_clip: 1.0
+  num_workers: 8
+  ema: true
+  ema_decay: 0.9995
+  strong_clip_aug: true
+  mixup_alpha: 0.2         # exp5 value, unchanged
+  aux_loss:
+    enabled: true
+    weight: 0.3            # total = main_CE + 0.3 * mean_t CE(per_frame_logits, label)
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp7_tsm_r50_mlp_aux_long.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: resnet50-tsm-tf-mlp-aux-long
+  tags: [track1, supervised, tsm, resnet50, transformer, mlp, aux, ema, long]

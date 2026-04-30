@@ -60,7 +60,7 @@ def main(cfg: DictConfig) -> None:
     model = load_model_from_checkpoint(raw, device)
 
     # Normalization must match how the checkpoint was trained (ImageNet stats if pretrained).
-    pretrained_used = bool(raw.get("pretrained", cfg.model.pretrained))
+    pretrained_used = bool(raw.get("pretrained", cfg.model.get("pretrained", False)))
     eval_transform = build_transforms(is_training=False, use_imagenet_norm=pretrained_used)
 
     val_dir = Path(cfg.dataset.val_dir).resolve()
