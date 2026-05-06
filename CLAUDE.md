@@ -6,9 +6,7 @@ CSC_43M04_EP (École Polytechnique Modal d'informatique, Deep Learning in Comput
 
 - Task: classify each video into one of **33 action classes** (Something-Something v2-style data).
 - Input: a folder of extracted JPG frames per video. Model sees a fixed number of frames per clip (default `num_frames=8`).
-- Two tracks, both in scope:
-  - **Track 1 — Closed World:** train from scratch, no ImageNet weights. Entry point: `experiment=baseline_from_scratch`.
-  - **Track 2 — Open World:** ImageNet-pretrained backbones allowed. Entry point: `experiment=baseline_pretrained`.
+- **Active track: Track 1 — Closed World** (train from scratch, no ImageNet/external pretraining). Entry point: `experiment=baseline_from_scratch`. Track 2 (open world) is **out of scope** for this project — do not propose ImageNet-pretrained backbones or other external weights.
 
 ## Stack
 
@@ -101,5 +99,19 @@ Class index space is `0..32` (33 classes), with **27 absent** from the on-disk f
 - **Propose changes before editing.** Explain the approach + tradeoffs first; wait for a "go" before modifying files. This is the default mode for this repo.
 - **Always smoke-test before long training.** Use `dataset.max_samples=64 training.epochs=1 training.batch_size=4` (or similar) to verify the pipeline end-to-end before committing GPU hours.
 - **Every training run must survive SSH disconnection.** No exceptions — a full `python src/train.py …` call is never launched in the foreground. Wrap it in `tmux new -s <name> "<cmd> 2>&1 | tee <name>.log"` (preferred) or `nohup <cmd> > <name>.log 2>&1 & disown` (fallback). Smoke tests can stay in the foreground; anything over ~1 min cannot.
-- **Current goal:** design a new architecture, or merge ideas from recent SOTA, to maximize accuracy on the challenge. Both tracks matter. Open to recent ideas — temporal transformers, 3D / (2+1)D CNNs, pretrained video backbones (VideoMAE, TimeSformer, X3D, V-JEPA, etc.), two-stream, masked modeling, distillation. Surface options with tradeoffs rather than picking unilaterally.
+- **Current goal:** design a new architecture, or merge ideas from recent SOTA, to maximize Track 1 accuracy. Track 1 only — from-scratch / SSL-on-challenge-data is fair game (V-JEPA-style frame-pair, MAE, iBOT, masked modeling, distillation, temporal transformers, 3D / (2+1)D CNNs, two-stream); ImageNet-pretrained or other external-weight backbones are not. Surface options with tradeoffs rather than picking unilaterally.
 - User background: comfortable with PyTorch; frame explanations accordingly (no need to re-explain basics, but video-specific terminology is worth grounding briefly).
+
+## Per-run protocol (every training launch follows this)
+
+Each new training run goes through these five steps in order. Don't skip; if a step doesn't apply, say so explicitly.
+
+1. **Experiment note (concise).** Before launching, write 1 short paragraph + a tiny ASCII sketch describing what's new vs. the prior run (architecture diff, loss, augmentation, schedule). Save under `notes/<exp_id>_<slug>.md` and pass the same text as the **W&B run notes** (e.g. via `wandb.init(notes=...)` or `WANDB_NOTES=...`) so the run is self-describing in the W&B UI. Keep it telegraphic — sketches over prose.
+2. **Robust launch.** The run must survive reboots, killed tmux sessions, and SSH drops:
+   - Wrap in tmux: `tmux new -s <exp_id> "python src/train.py experiment=<exp_id> 2>&1 | tee <exp_id>.log"`.
+   - Enable W&B resumable runs (`wandb.init(id=<exp_id>, resume="allow")`) so a restart re-attaches to the same dashboard.
+   - Save checkpoints frequently enough that a crash loses minutes, not hours; ensure resume-from-last-checkpoint works (don't rely solely on best-by-val-acc).
+   - If a host reboot is plausible, prefer a systemd/`@reboot` cron entry or a small relauncher script over assuming tmux survives.
+3. **Monitor regularly.** Don't fire-and-forget. Periodically (and on every "is X still running?" follow-up) re-check: `tmux ls`, `nvidia-smi`, `tail` the log, and the W&B curves. Flag divergence (NaN, flat loss, val crash) early instead of waiting for the run to finish.
+4. **Interpret the result (concise).** When the run ends, write 2–4 bullets: best val top-1/top-5, vs. the prior baseline, what likely caused the delta, what to try next. Append to the same `notes/<exp_id>_<slug>.md`. No long write-ups.
+5. **Create a submission.** Run `python src/create_submission.py training.checkpoint_path=<best>.pt`, sanity-check the CSV shape and class distribution, and record the resulting filename in the experiment note.
