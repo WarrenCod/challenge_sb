@@ -6,9 +6,8 @@ CSC_43M04_EP (École Polytechnique Modal d'informatique, Deep Learning in Comput
 
 - Task: classify each video into one of **33 action classes** (Something-Something v2-style data).
 - Input: a folder of extracted JPG frames per video. Model sees a fixed number of frames per clip (default `num_frames=8`).
-- Two tracks, both in scope:
-  - **Track 1 — Closed World:** train from scratch, no ImageNet weights. Entry point: `experiment=baseline_from_scratch`.
-  - **Track 2 — Open World:** ImageNet-pretrained backbones allowed. Entry point: `experiment=baseline_pretrained`.
+- Two tracks exist, but **active focus is Track 1 — Closed World** (train from scratch, no ImageNet weights). Entry point: `experiment=baseline_from_scratch`.
+  - Track 2 — Open World (ImageNet-pretrained backbones, `experiment=baseline_pretrained`) is parked unless explicitly revisited.
 
 ## Stack
 
@@ -100,6 +99,10 @@ Class index space is `0..32` (33 classes), with **27 absent** from the on-disk f
 
 - **Propose changes before editing.** Explain the approach + tradeoffs first; wait for a "go" before modifying files. This is the default mode for this repo.
 - **Always smoke-test before long training.** Use `dataset.max_samples=64 training.epochs=1 training.batch_size=4` (or similar) to verify the pipeline end-to-end before committing GPU hours.
-- **Every training run must survive SSH disconnection.** No exceptions — a full `python src/train.py …` call is never launched in the foreground. Wrap it in `tmux new -s <name> "<cmd> 2>&1 | tee <name>.log"` (preferred) or `nohup <cmd> > <name>.log 2>&1 & disown` (fallback). Smoke tests can stay in the foreground; anything over ~1 min cannot.
-- **Current goal:** design a new architecture, or merge ideas from recent SOTA, to maximize accuracy on the challenge. Both tracks matter. Open to recent ideas — temporal transformers, 3D / (2+1)D CNNs, pretrained video backbones (VideoMAE, TimeSformer, X3D, V-JEPA, etc.), two-stream, masked modeling, distillation. Surface options with tradeoffs rather than picking unilaterally.
+- **Every training run must survive SSH disconnection, host reboot, and accidental tmux kills.** No exceptions — a full `python src/train.py …` call is never launched in the foreground. Wrap it in `tmux new -s <name> "<cmd> 2>&1 | tee <name>.log"` (preferred) or `nohup <cmd> > <name>.log 2>&1 & disown` (fallback). Smoke tests can stay in the foreground; anything over ~1 min cannot. Beyond tmux, every long run should also: (a) checkpoint frequently to disk so a crash loses at most one epoch, (b) be relaunchable from the latest checkpoint without manual surgery, and (c) tee a persistent log file so progress survives even if the tmux pane is gone.
+- **Each run gets a short experiment note on W&B.** When launching a training run, log a concise note in the W&B run description / config: 1–3 lines + a tiny ASCII sketch of the architecture or the key change vs. the previous run. Goal: skim a run on W&B and immediately know what it tests. Keep it terse — no prose paragraphs.
+- **Monitor training on a regular cadence.** Don't fire-and-forget: periodically re-check tmux session health, GPU utilization (`nvidia-smi`), and the loss/accuracy trajectory in the log or on W&B. Catch divergence, NaNs, or stalls early instead of after the fact.
+- **End every run with a concise interpretation.** Once training finishes (or is stopped), write a 2–4 line takeaway: what the run achieved (best val acc), what worked / didn't, and what it implies for the next iteration. No essays.
+- **Always create a submission at the end of a successful run.** After training + interpreting, run `python src/create_submission.py training.checkpoint_path=<best>.pt` and surface the resulting CSV path. Don't leave a finished run without a submission file.
+- **Current goal:** design a new architecture, or merge ideas from recent SOTA, to maximize Track 1 accuracy on the challenge. Open to recent ideas — temporal transformers, 3D / (2+1)D CNNs, masked modeling, V-JEPA-style SSL, distillation, two-stream — but constrained to from-scratch training. Surface options with tradeoffs rather than picking unilaterally.
 - User background: comfortable with PyTorch; frame explanations accordingly (no need to re-explain basics, but video-specific terminology is worth grounding briefly).
