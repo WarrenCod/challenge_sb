@@ -6,9 +6,8 @@ CSC_43M04_EP (École Polytechnique Modal d'informatique, Deep Learning in Comput
 
 - Task: classify each video into one of **33 action classes** (Something-Something v2-style data).
 - Input: a folder of extracted JPG frames per video. Model sees a fixed number of frames per clip (default `num_frames=8`).
-- Two tracks, both in scope:
-  - **Track 1 — Closed World:** train from scratch, no ImageNet weights. Entry point: `experiment=baseline_from_scratch`.
-  - **Track 2 — Open World:** ImageNet-pretrained backbones allowed. Entry point: `experiment=baseline_pretrained`.
+- **Active track: Track 1 — Closed World only.** Train from scratch, no ImageNet / external pretrained weights. Entry point: `experiment=baseline_from_scratch`. SSL pretraining on the challenge data itself is allowed (and in scope). Track 2 is **not** being pursued — do not propose ImageNet-pretrained backbones.
+  - (Reference) Track 2 — Open World: ImageNet-pretrained backbones. Entry point: `experiment=baseline_pretrained`. Out of scope for this user.
 
 ## Stack
 
@@ -100,6 +99,29 @@ Class index space is `0..32` (33 classes), with **27 absent** from the on-disk f
 
 - **Propose changes before editing.** Explain the approach + tradeoffs first; wait for a "go" before modifying files. This is the default mode for this repo.
 - **Always smoke-test before long training.** Use `dataset.max_samples=64 training.epochs=1 training.batch_size=4` (or similar) to verify the pipeline end-to-end before committing GPU hours.
-- **Every training run must survive SSH disconnection.** No exceptions — a full `python src/train.py …` call is never launched in the foreground. Wrap it in `tmux new -s <name> "<cmd> 2>&1 | tee <name>.log"` (preferred) or `nohup <cmd> > <name>.log 2>&1 & disown` (fallback). Smoke tests can stay in the foreground; anything over ~1 min cannot.
-- **Current goal:** design a new architecture, or merge ideas from recent SOTA, to maximize accuracy on the challenge. Both tracks matter. Open to recent ideas — temporal transformers, 3D / (2+1)D CNNs, pretrained video backbones (VideoMAE, TimeSformer, X3D, V-JEPA, etc.), two-stream, masked modeling, distillation. Surface options with tradeoffs rather than picking unilaterally.
+- **Current goal:** Track 1 only — design a new architecture (or merge ideas from recent from-scratch / SSL SOTA) to maximize val accuracy. In scope: temporal transformers, 3D / (2+1)D CNNs, two-stream, masked modeling, SSL pretraining on challenge data, distillation between from-scratch models. **Out of scope:** ImageNet/Kinetics/anything-else pretrained weights. Surface options with tradeoffs rather than picking unilaterally.
 - User background: comfortable with PyTorch; frame explanations accordingly (no need to re-explain basics, but video-specific terminology is worth grounding briefly).
+
+## Run protocol (mandatory for every training run)
+
+Every training run — not just "long" ones, every one beyond the smoke-test — must follow this protocol end-to-end. Smoke tests are still allowed in the foreground; everything else goes through the full loop below.
+
+1. **Pre-run note (concise).** Before launching, post a short experiment card to W&B (`wandb.init(notes=...)` or update the run description) with:
+   - One-line hypothesis ("does TSM-R50 + temporal MLP beat exp7?").
+   - ASCII architecture sketch, e.g. `frames → R50-TSM → GAP → MLP(256) → 33-way`.
+   - Key knobs that differ from the previous best (lr, num_frames, aug, epochs).
+   Mirror the same note as the first lines of `<run>.log` so it survives even if W&B is unreachable.
+
+2. **Robust launch.** Runs must survive **SSH drop, tmux kill, and host reboot**. Concretely:
+   - Wrap in tmux: `tmux new -s <name> "<cmd> 2>&1 | tee <name>.log"`. Never foreground.
+   - Save a checkpoint **every epoch** (best-by-val-acc + a `last.pt`), so a kill/reboot loses ≤1 epoch.
+   - Make the launcher resume-aware: if `last.pt` exists for this run name, resume from it instead of restarting from scratch. If `src/train.py` doesn't yet support `--resume`, add it (load model + optimizer + scheduler + epoch + RNG state) before kicking off any multi-hour run.
+   - W&B: pass a stable `id=<run_name>` and `resume="allow"` so a restart appends to the same run instead of creating a new one.
+   - Log to W&B from inside the training loop (loss, val acc top-1/top-5, lr) every epoch — not only at the end — so partial progress is visible.
+   - Reboot resilience: if a run is expected to span >24h, register a `@reboot` cron (or systemd user unit) that re-execs the same tmux command; the resume logic above takes care of state.
+
+3. **Monitor regularly.** During a long run, periodically (every ~30–60 min while actively working, or at natural check-in points) inspect: `tmux ls` + `tmux capture-pane`, `nvidia-smi`, last lines of `<name>.log`, and the W&B run page. Flag stalls (loss flat, GPU idle, OOM, NaN) immediately rather than waiting for completion. Re-check live state on every "is it still running?" — don't reuse old snapshots.
+
+4. **Post-run interpretation (concise).** When training finishes (or is killed), write a 3–6 line debrief: best val top-1/top-5, epoch where it peaked, comparison to the previous best, one sentence on what likely drove the delta, and one next-step suggestion. Put it in the W&B run summary and append it to `<name>.log`.
+
+5. **Always create a submission.** After every completed run that improves (or plausibly improves) val accuracy, run `python src/create_submission.py training.checkpoint_path=<best.pt>` and save the CSV alongside the checkpoint. Even if not submitted to the leaderboard, keep the artifact so we can compare distributions across runs.
