@@ -6,7 +6,7 @@ CSC_43M04_EP (École Polytechnique Modal d'informatique, Deep Learning in Comput
 
 - Task: classify each video into one of **33 action classes** (Something-Something v2-style data).
 - Input: a folder of extracted JPG frames per video. Model sees a fixed number of frames per clip (default `num_frames=8`).
-- **Track 1 — Closed World ONLY.** Train from scratch, no ImageNet weights. Entry point: `experiment=baseline_from_scratch`. Track 2 (open-world / pretrained) is out of scope for this user — never propose ImageNet-pretrained backbones, `pretrained: true`, or LLRD on a pretrained ViT.
+- **Track 2 — Open World.** Pretrained backbones are allowed (ImageNet, Kinetics, DINOv2, VideoMAE, etc.). `pretrained: true`, LLRD on pretrained ViTs, and other transfer-learning patterns are all on the table. Track 1 (from-scratch only) is out of scope for this user.
 
 ## Stack
 
@@ -99,5 +99,5 @@ Class index space is `0..32` (33 classes), with **27 absent** from the on-disk f
 - **Propose changes before editing.** Explain the approach + tradeoffs first; wait for a "go" before modifying files. This is the default mode for this repo.
 - **Always smoke-test before long training.** Use `dataset.max_samples=64 training.epochs=1 training.batch_size=4` (or similar) to verify the pipeline end-to-end before committing GPU hours.
 - **Every training run must survive SSH disconnection.** No exceptions — a full `python src/train.py …` call is never launched in the foreground. Wrap it in `tmux new -s <name> "<cmd> 2>&1 | tee <name>.log"` (preferred) or `nohup <cmd> > <name>.log 2>&1 & disown` (fallback). Smoke tests can stay in the foreground; anything over ~1 min cannot.
-- **Current goal:** design a new architecture, or merge ideas from recent SOTA, to maximize accuracy on the challenge **for Track 1 only** (no ImageNet weights). Open to recent ideas — temporal transformers, 3D / (2+1)D CNNs, masked modeling (VideoMAE/V-JEPA SSL on this dataset only), distillation between in-house teachers. Pretrained ImageNet/Kinetics backbones are off-limits. Surface options with tradeoffs rather than picking unilaterally.
+- **Current goal:** maximize accuracy on the challenge **for Track 2** (pretrained weights allowed). Open to ImageNet-pretrained ViTs, DINOv2, Kinetics-pretrained VideoMAE / V-JEPA, temporal transformers on top of pretrained image encoders, and distillation. Surface options with tradeoffs rather than picking unilaterally.
 - User background: comfortable with PyTorch; frame explanations accordingly (no need to re-explain basics, but video-specific terminology is worth grounding briefly).

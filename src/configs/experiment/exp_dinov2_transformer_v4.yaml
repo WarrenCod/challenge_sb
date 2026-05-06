@@ -1,0 +1,45 @@
+# @package _global_
+# Track-2 fine-tune v4: DINOv2 ViT-B/14 (reg4, pretrained) + 2-layer temporal
+# Transformer + MLP head. Successor to v3 (best 68.10% on the final epoch of 70).
+#
+# Two structural changes vs v3:
+#   - Backbone ViT-S -> ViT-B (22M -> 86M params, embed 384 -> 768).
+#     DINOv2 ViT-B typically gives +3-5 pp downstream over ViT-S.
+#   - epochs 70 -> 100. v1/v2/v3 all peaked on the very last epoch — schedule
+#     keeps being under-budgeted.
+#
+# Recipe (mixup/smoothing/EMA/LLRD) inherited from v3 — those landed in a good
+# place; backbone capacity is the lever to pull next.
+#
+# Batch size 16 (was 32 on ViT-S): ViT-B is ~4x heavier, this fits 24 GB with AMP.
+# lr 5e-4 kept (fine-tuning lr is not very batch-sensitive; LLRD anyway scales
+# early blocks to ~1.5e-6).
+defaults:
+  - override /model: vit_dinov2b_transformer
+
+dataset:
+  num_frames: 4
+
+training:
+  optimizer: adamw
+  batch_size: 16              # was 32 on ViT-S; halved for ViT-B fit
+  num_workers: 8
+  lr: 0.0005
+  llrd: 0.65
+  epochs: 100                 # was 70 — v3 still peaked on the final epoch
+  weight_decay: 0.05
+  warmup_epochs: 5
+  grad_clip: 1.0
+  amp: true
+  mixup_alpha: 0.0            # kept off (v3 best)
+  label_smoothing: 0.025      # kept (v3 best)
+  strong_clip_aug: true
+  ema_decay: 0.9999
+  checkpoint_path: ${hydra:runtime.cwd}/best_dinov2_transformer_v4.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  project: csc43m04ep
+  run_name: dinov2-b14-reg4-transformer-v4
+  tags: [track2, pretrained, dinov2, vit_b14, modular, v4, longer_schedule]

@@ -1,0 +1,46 @@
+# @package _global_
+# Track-2 fine-tune: DINOv2 ViT-S/14 (reg4, pretrained) + 2-layer temporal
+# Transformer + MLP head. First Track-2 baseline on the rouloul branch.
+#
+# Recipe rationale:
+#   - LLRD 0.65: aggressive enough to keep early DINOv2 layers near-frozen
+#     (the pretrained features are very strong; over-tuning early layers wipes
+#     them out on a 36k-clip dataset).
+#   - lr 5e-4 (head + last block): standard for fine-tuning ViT-S with LLRD.
+#   - epochs 30, warmup 5: plenty for a pretrained model on 36k clips.
+#   - num_frames 4: hard cap from data.
+#   - hflip OFF (SSv2 labels are direction-sensitive).
+#   - strong_clip_aug ON: aug diversifies without breaking pretrained statistics
+#     too aggressively (no hflip, consistent across frames).
+#   - mixup 0.2 + label_smoothing 0.1: mild regularisation, helps a 22M-param
+#     fine-tune avoid over-fitting on 36k clips.
+#   - ema_decay 0.9999: standard for ViT fine-tuning, smooths val curve.
+defaults:
+  - override /model: vit_dinov2_transformer
+
+dataset:
+  num_frames: 4
+
+training:
+  optimizer: adamw
+  batch_size: 32              # DINOv2-S is heavier than vit_ti; 32 fits comfortably
+  num_workers: 8
+  lr: 0.0005                  # 5e-4: head + deepest block; LLRD scales earlier blocks
+  llrd: 0.65                  # layer-wise LR decay factor (aggressive — pretrained is strong)
+  epochs: 30
+  weight_decay: 0.05
+  warmup_epochs: 5
+  grad_clip: 1.0
+  amp: true
+  mixup_alpha: 0.2
+  label_smoothing: 0.1
+  strong_clip_aug: true       # SSv2-safe heavy aug (no hflip; consistent across frames)
+  ema_decay: 0.9999
+  checkpoint_path: ${hydra:runtime.cwd}/best_dinov2_transformer.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  project: csc43m04ep
+  run_name: dinov2-s14-reg4-transformer
+  tags: [track2, pretrained, dinov2, vit_s14, modular]

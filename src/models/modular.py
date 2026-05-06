@@ -26,6 +26,7 @@ import torch.nn as nn
 from models.base import Classifier, SpatialEncoder, TemporalProcessor
 from models.classifier.linear import LinearClassifier
 from models.classifier.mlp import MLPClassifier
+from models.spatial.dinov2 import DINOv2Encoder
 from models.spatial.resnet import ResNetEncoder
 from models.spatial.resnet_tsm import ResNetTSMEncoder
 from models.spatial.vit import ViTEncoder
@@ -48,6 +49,7 @@ SPATIAL_REGISTRY: Dict[str, type] = {
     "resnet_tsm": ResNetTSMEncoder,
     "vit": ViTEncoder,
     "vit_mae": ViTMAEEncoder,
+    "dinov2": DINOv2Encoder,
 }
 TEMPORAL_REGISTRY: Dict[str, type] = {
     "mean_pool": MeanPoolTemporal,

@@ -1,0 +1,44 @@
+# @package _global_
+# Track-2 fine-tune v3: DINOv2 ViT-S/14 (reg4, pretrained) + 2-layer temporal
+# Transformer + MLP head. Successor to exp_dinov2_transformer_v2 (best 67.26%
+# at the final epoch of 50).
+#
+# v2 diagnosis (notes/dinov2_transformer_v1.md + dinov2_v2.log):
+#   - Best on the *last* epoch of 50 ⇒ schedule still under-budgeted.
+#   - train_acc 41.6% << val_acc 67.3% ⇒ mixup + smoothing still over-flattening
+#     the train signal.
+#
+# v3 changes vs v2 (recipe-only, backbone/LLRD/EMA/bs/lr unchanged):
+#   - epochs 50 → 70           (give cosine room; v1 and v2 both peaked on final)
+#   - mixup_alpha 0.1 → 0.0    (off — train signal is the bottleneck)
+#   - label_smoothing 0.05 → 0.025 (further eased)
+#   - new checkpoint path so v2's best is preserved.
+defaults:
+  - override /model: vit_dinov2_transformer
+
+dataset:
+  num_frames: 4
+
+training:
+  optimizer: adamw
+  batch_size: 32
+  num_workers: 8
+  lr: 0.0005
+  llrd: 0.65
+  epochs: 70                  # was 50 — v2 peaked on the final epoch
+  weight_decay: 0.05
+  warmup_epochs: 5
+  grad_clip: 1.0
+  amp: true
+  mixup_alpha: 0.0            # was 0.1 — off
+  label_smoothing: 0.025      # was 0.05 — eased
+  strong_clip_aug: true
+  ema_decay: 0.9999
+  checkpoint_path: ${hydra:runtime.cwd}/best_dinov2_transformer_v3.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  project: csc43m04ep
+  run_name: dinov2-s14-reg4-transformer-v3
+  tags: [track2, pretrained, dinov2, vit_s14, modular, v3, no_mixup, longer_schedule]

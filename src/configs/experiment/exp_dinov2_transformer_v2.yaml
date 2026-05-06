@@ -1,0 +1,43 @@
+# @package _global_
+# Track-2 fine-tune v2: DINOv2 ViT-S/14 (reg4, pretrained) + 2-layer temporal
+# Transformer + MLP head. Successor to exp_dinov2_transformer (v1, run u6mz76ai,
+# best val 65.31% on the final epoch).
+#
+# v1 diagnosis (notes/dinov2_transformer_v1.md):
+#   - Best on the *last* epoch ⇒ schedule undersized.
+#   - train_acc 36% < val_acc 65% ⇒ mixup + label smoothing over-flatten train.
+#
+# v2 changes vs v1 (reg + schedule only — backbone, LLRD, EMA, bs, lr unchanged):
+#   - epochs 30 → 50         (let cosine actually decay to 0)
+#   - mixup_alpha 0.2 → 0.1  (less mixing, keeps train signal sharper)
+#   - label_smoothing 0.1 → 0.05  (gentler prior)
+#   - new checkpoint path so v1's best is preserved.
+defaults:
+  - override /model: vit_dinov2_transformer
+
+dataset:
+  num_frames: 4
+
+training:
+  optimizer: adamw
+  batch_size: 32
+  num_workers: 8
+  lr: 0.0005
+  llrd: 0.65
+  epochs: 50                  # was 30 — v1 peaked on the final epoch
+  weight_decay: 0.05
+  warmup_epochs: 5
+  grad_clip: 1.0
+  amp: true
+  mixup_alpha: 0.1            # was 0.2 — eased
+  label_smoothing: 0.05       # was 0.1 — eased
+  strong_clip_aug: true
+  ema_decay: 0.9999
+  checkpoint_path: ${hydra:runtime.cwd}/best_dinov2_transformer_v2.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  project: csc43m04ep
+  run_name: dinov2-s14-reg4-transformer-v2
+  tags: [track2, pretrained, dinov2, vit_s14, modular, v2, eased_reg]

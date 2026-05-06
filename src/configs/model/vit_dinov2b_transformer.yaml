@@ -1,0 +1,27 @@
+# @package _global_
+# DINOv2 ViT-B/14 (reg4, pretrained on LVD-142M) -> 2-layer Transformer -> MLP head.
+#
+# Step up from vit_dinov2_transformer (ViT-S/14): same recipe family, ~4x backbone
+# capacity. embed_dim 768 -> cls_avg out_dim = 1536 = 12 heads * 128 per head.
+# Temporal head sized to that; 5 tokens (CLS + T=4) so 2 layers is still plenty.
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: dinov2
+    variant: vit_base_patch14_reg4_dinov2.lvd142m
+    pretrained: true
+    pool: cls_avg              # out_dim = 2 * 768 = 1536
+    drop_path: 0.1
+    freeze_backbone: false     # full fine-tune via LLRD
+    image_size: 224            # 16 * 14 = 224
+  temporal:
+    name: transformer
+    num_heads: 12              # 1536 / 12 = 128 per head
+    num_layers: 2
+    dropout: 0.1
+    drop_path: 0.0
+  classifier:
+    name: mlp
+    hidden_dim: 768            # bottleneck below 1536 to limit head capacity
+    dropout: 0.2

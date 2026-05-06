@@ -1,0 +1,49 @@
+# @package _global_
+# vit-tf-2: Track-1 (scratch) ViT-Ti/16 spatial + 2-layer temporal Transformer + MLP head.
+#
+# Successor to vit_transformer_mlp (v1, run 0qjn39xs, best val 9.22%). v1 was
+# severely under-fit: train_acc=7.5% < val_acc=9.0%, train loss sat at the
+# mixup+smoothing floor for 30+ epochs. Diagnosis in notes/vit_transformer_mlp_v1.md.
+#
+# What changes vs v1:
+#   - num_frames: 8 → 4. Every clip on disk has exactly 4 frames; v1 was
+#     duplicating ([0,0,1,1,2,2,3,3]), so half the temporal tokens were redundant.
+#   - Backbone: vit_s_16 → vit_ti_16. Smaller (5.7M vs 22M) → more signal per
+#     gradient on 36k clips. v1 was gradient-bound, not capacity-bound.
+#   - Reg gradient-flatteners stripped: mixup off, EMA off, label_smoothing 0.1→0.05,
+#     MLP dropout 0.5→0.2, drop_path 0.1/0.1 → 0.05/0.0.
+#   - Temporal head matched to token count: 4 layers → 2 layers (5 tokens, CLS+4).
+#   - Compute used: batch 16 → 64 (v1 peaked at 1.08 GB on a 24 GB card),
+#     lr 3e-4 → 6e-4 (linear scale).
+#   - strong_clip_aug stays ON: aug diversifies data without flattening the gradient,
+#     and strong_clip_aug=false would fall back to per-frame independent crops which
+#     scramble the temporal correspondence the head needs.
+#   - Hflip stays OFF (SSv2 labels are direction-sensitive).
+#   - Schedule shortened 60 → 50 (v1 plateaued at epoch 48 of 60).
+defaults:
+  - override /model: vit_tf_2
+
+dataset:
+  num_frames: 4                # hard cap from data — no duplication
+
+training:
+  optimizer: adamw
+  batch_size: 64
+  num_workers: 8
+  lr: 0.0006                   # 6e-4: linear-scaled from v1's 3e-4 at bs=16
+  epochs: 50
+  weight_decay: 0.05
+  warmup_epochs: 5
+  grad_clip: 1.0
+  amp: true
+  mixup_alpha: 0.0             # off — v1's mixup pinned train loss at the floor
+  label_smoothing: 0.05        # mild prior, doesn't crush gradient
+  strong_clip_aug: true        # SSv2-safe heavy aug (no hflip; consistent across frames)
+  ema_decay: 0.0               # off — too slow for an under-fit model
+  checkpoint_path: ${hydra:runtime.cwd}/best_vit_tf_2.pt
+
+wandb:
+  enabled: true
+  project: csc43m04ep
+  run_name: vit-tf-2
+  tags: [track1, scratch, vit_ti16, modular, vit_tf_2]
