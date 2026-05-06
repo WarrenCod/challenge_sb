@@ -37,6 +37,28 @@ def collect_frame_paths(root_dir: Path) -> List[Path]:
     return paths
 
 
+def collect_frame_paths_deep(root_dirs) -> List[Path]:
+    """Concatenate frame paths under any number of roots, depth-agnostic.
+
+    Walks each root recursively (rglob) so it handles `train/CLS/video/frame.jpg`
+    (3 levels) and `test/video/frame.jpg` (2 levels) uniformly. Required for
+    SSL pretraining over the train+val+test pool.
+    """
+    exts = {".jpg", ".jpeg", ".png", ".webp"}
+    out: List[Path] = []
+    for root in root_dirs:
+        root = Path(root).resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Dataset root not found: {root}")
+        for p in root.rglob("*"):
+            if p.is_file() and p.suffix.lower() in exts:
+                out.append(p)
+    if not out:
+        raise RuntimeError(f"No frames under any of: {root_dirs}")
+    out.sort()
+    return out
+
+
 class FrameDataset(Dataset):
     def __init__(
         self,

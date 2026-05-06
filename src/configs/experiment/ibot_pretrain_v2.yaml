@@ -1,0 +1,76 @@
+# @package _global_
+# Stage 1 v2 — strengthened iBOT pretraining for Track 1 "best quality" budget.
+# Entry point: `python src/pretrain_ibot.py experiment=ibot_pretrain_v2`
+#
+# Differences vs `ibot_pretrain` (v1):
+#   - Frame pool: train + val + test (~234K frames vs ~180K) — self-supervised, fully Track-1-legal.
+#   - Local crops: 8 (DINO standard) vs 4.
+#   - Epochs: 300 vs 100 — DINO/iBOT scale roughly monotonically with epochs at this data size.
+#   - Teacher-temp warmup: 50 vs 30 epochs (gentler ramp under longer training).
+#   - EMA momentum schedule still cosine 0.996→1.0, just stretched over 300 epochs.
+#   - Backbone unchanged (ViT-S/16): ViT-B is not justified at 234K frames.
+
+dataset:
+  pretrain_dirs:
+    - ${hydra:runtime.cwd}/processed_data/train
+    - ${hydra:runtime.cwd}/processed_data/val
+    - ${hydra:runtime.cwd}/processed_data/test
+
+ibot:
+  global_size: 224
+  local_size: 96
+  patch_size: 16
+  n_local_crops: 8              # DINO-standard count of local views
+  global_scale: [0.4, 1.0]
+  local_scale: [0.05, 0.4]
+  embed_dim: 384                # ViT-S
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  drop_path: 0.1
+  out_dim: 8192
+  mask_ratio_min: 0.1
+  mask_ratio_max: 0.5
+
+training:
+  batch_size: 128               # 256 OOM'd on A5000 (24 GB) at 2 global + 8 local. Halved.
+  base_lr: 5.0e-4               # effective lr = base_lr * batch_size / 256 → 2.5e-4 here
+  final_lr: 1.0e-6
+  weight_decay: 0.04
+  final_weight_decay: 0.4
+  warmup_epochs: 10
+  epochs: 300
+  amp: true
+  num_workers: 8
+  grad_clip: 3.0
+  ema_momentum: 0.996           # cosine 0.996 → 1.0 over 300 epochs
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 50
+  student_temp: 0.1
+  center_momentum: 0.9
+  mim_weight: 1.0
+  freeze_last_layer_epochs: 1
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/ibot_stage1.pt
+  snapshot_every: 25
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: ibot_pretrain_v2
+  run_id: ibot_pretrain_v2      # stable id → re-launches resume the same W&B record
+  tags: [track1, stage1, ibot, v2, pretraining]
+  notes: |
+    Stage 1 v2 — iBOT (DINO + MIM) on the train+val+test frame pool (~234K frames).
+    No flips anywhere. ViT-S/16, 2 global + 8 local crops, 300 ep, batch 256.
+    Output: checkpoints/ibot_stage1.pt (EMA-teacher encoder for Stage 2).
+
+    Sketch:
+      Frame ──► Aug × (2 global @224² + 8 local @96²) ──► ViT-S/16 ──► [CLS] + patch tokens
+                                                              │
+                                              iBOT head (3-MLP + L2 + WeightNorm, dim 8192)
+                                                              │
+                                  DINO loss (CLS soft-CE student↔teacher, multi-crop pairs)
+                                            +  MIM loss (patch soft-CE on block-masked positions)
+
+    Loss = DINO_cls + 1.0 · MIM_token   |   teacher = EMA(student), 0.996→1.0 cosine

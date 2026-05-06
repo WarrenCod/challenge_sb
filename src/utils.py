@@ -511,6 +511,7 @@ def init_wandb(cfg, default_run_name: Optional[str] = None) -> bool:
             entity=wb_cfg.get("entity"),
             mode=wb_cfg.get("mode", "online"),
             name=wb_cfg.get("run_name") or default_run_name,
+            notes=wb_cfg.get("notes"),
             config=OmegaConf.to_container(cfg, resolve=True),
             tags=list(wb_cfg.get("tags", []) or []),
             resume="allow",

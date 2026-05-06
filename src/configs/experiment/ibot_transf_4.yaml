@@ -1,0 +1,74 @@
+# @package _global_
+# Stage 2 v4 — temporal-transformer fine-tune over the new Stage-1 v2 encoder.
+# Entry point: `python src/train.py experiment=ibot_transf_4`
+#
+# Recipe inherited from ibot_transf_3 (the corrected design after v2's collapse):
+#   - LP-FT: spatial trunk frozen for 5 epochs, then unfrozen with LLRD 0.70.
+#   - EMA self-distillation (decay 0.999, distill α=0.5, T=2). Eval on live student.
+#   - Soft aug preset (RRC 0.7-1.0, ColorJitter 0.3/0.05, RandAug n=2/m=6, RE p=0.15).
+#   - Mixup α=0.1, NO CutMix (kills SSv2 motion direction).
+#   - bf16 AMP, label smoothing 0.1, grad clip 1.0.
+# Differences vs v3:
+#   - Reads the **new** Stage-1 v2 encoder (same path: checkpoints/ibot_stage1.pt).
+#   - Epochs 100 (was 80) — v1 was still climbing at ep48/50.
+#   - W&B run_id pinned + intent note for resume + traceability.
+
+defaults:
+  - override /model: vit_mae_transformer
+
+model:
+  spatial:
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/ibot_stage1.pt
+
+dataset:
+  num_frames: 4               # forced: every video on disk has exactly 4 frames
+
+training:
+  batch_size: 32
+  lr: 5.0e-4
+  llrd: 0.70
+  epochs: 100
+  warmup_epochs: 5
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+
+  # Augmentation — soft preset (no hflip/vflip; SSv2-safe).
+  aug_strength: soft
+  mixup_alpha: 0.1
+  cutmix_alpha: 0.0
+
+  # LP-FT: freeze spatial trunk while head warms up.
+  freeze_backbone_epochs: 5
+
+  # EMA + self-distillation.
+  ema: true
+  ema_decay: 0.999
+  distill_alpha: 0.5
+  distill_temperature: 2.0
+  eval_on_ema: false          # eval the live student; the EMA is the soft teacher
+
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/ibot_transf_4.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: ibot_transf_4
+  run_id: ibot_transf_4
+  tags: [track1, stage2, ibot, transformer, v4, lpft, distill]
+  notes: |
+    Stage 2 v4 — temporal Transformer over Stage-1 v2 encoder (iBOT, 300ep, train+val+test pool).
+    Recipe = v3 (LP-FT + EMA-distill, no cutmix, soft aug). 100 ep, batch 32, bf16.
+
+    Sketch:
+      Clip(B,4,3,224,224) ──► ViT-S/16 (Stage-1 v2 encoder, LP-FT+LLRD=0.70) ──► (B,4,D=384) tokens
+                                                                                    │
+                                                          Temporal Transformer (2-layer)
+                                                                                    │
+                                                                    Linear head ──► logits(B,33)
+
+    Loss = (1-α)·CE(student) + α·KL(student || EMA-teacher / T)   with α=0.5, T=2, EMA-decay=0.999
+    Aug:  RRC + ColorJitter + RandAug(n=2,m=6) + RandomErasing(p=0.15) + Mixup(α=0.1)   — no flips

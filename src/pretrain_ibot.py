@@ -33,7 +33,7 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from dataset.frame_dataset import collect_frame_paths
+from dataset.frame_dataset import collect_frame_paths, collect_frame_paths_deep
 from dataset.ibot_dataset import MultiCropAug, ibot_collate, iBOTFrameDataset
 from models.ibot import MultiCropEncoder, ema_update, iBOTHead, iBOTViT
 from utils import (
@@ -173,11 +173,20 @@ def main(cfg: DictConfig) -> None:
     device = torch.device(device_str)
 
     # --- data ---
-    train_dir = Path(cfg.dataset.train_dir).resolve()
-    frame_paths = collect_frame_paths(train_dir)
+    pretrain_dirs = cfg.dataset.get("pretrain_dirs")
+    if pretrain_dirs:
+        roots = [Path(d).resolve() for d in pretrain_dirs]
+        frame_paths = collect_frame_paths_deep(roots)
+        print(f"[ibot] {len(frame_paths)} frames pooled from {len(roots)} roots:")
+        for r in roots:
+            print(f"  - {r}")
+    else:
+        train_dir = Path(cfg.dataset.train_dir).resolve()
+        frame_paths = collect_frame_paths(train_dir)
+        print(f"[ibot] {len(frame_paths)} frames in {train_dir}")
     if cfg.dataset.get("max_samples") is not None:
         frame_paths = frame_paths[: int(cfg.dataset.max_samples)]
-    print(f"[ibot] {len(frame_paths)} frames in {train_dir}")
+        print(f"[ibot] truncated to max_samples={cfg.dataset.max_samples}")
 
     aug = MultiCropAug(
         global_size=int(cfg.ibot.global_size),

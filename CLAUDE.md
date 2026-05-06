@@ -5,10 +5,8 @@
 CSC_43M04_EP (École Polytechnique Modal d'informatique, Deep Learning in Computer Vision) — the **"What Happens Next?"** video classification challenge.
 
 - Task: classify each video into one of **33 action classes** (Something-Something v2-style data).
-- Input: a folder of extracted JPG frames per video. Model sees a fixed number of frames per clip (default `num_frames=8`).
-- Two tracks, both in scope:
-  - **Track 1 — Closed World:** train from scratch, no ImageNet weights. Entry point: `experiment=baseline_from_scratch`.
-  - **Track 2 — Open World:** ImageNet-pretrained backbones allowed. Entry point: `experiment=baseline_pretrained`.
+- Input: a folder of extracted JPG frames per video. Model sees a fixed number of frames per clip — **structurally capped at 4** for this dataset (each video has only `frame_000…003.jpg`).
+- **Working Track 1 — Closed World only.** No ImageNet weights, no externally-pretrained backbones. SSL pretraining on this challenge's own pixels (`processed_data/{train,val,test}`) is allowed because the supervision is internal. Entry point: `experiment=baseline_from_scratch`. Track 2 is out of scope; ignore `baseline_pretrained` unless explicitly told otherwise.
 
 ## Stack
 
@@ -101,5 +99,33 @@ Class index space is `0..32` (33 classes), with **27 absent** from the on-disk f
 - **Propose changes before editing.** Explain the approach + tradeoffs first; wait for a "go" before modifying files. This is the default mode for this repo.
 - **Always smoke-test before long training.** Use `dataset.max_samples=64 training.epochs=1 training.batch_size=4` (or similar) to verify the pipeline end-to-end before committing GPU hours.
 - **Every training run must survive SSH disconnection.** No exceptions — a full `python src/train.py …` call is never launched in the foreground. Wrap it in `tmux new -s <name> "<cmd> 2>&1 | tee <name>.log"` (preferred) or `nohup <cmd> > <name>.log 2>&1 & disown` (fallback). Smoke tests can stay in the foreground; anything over ~1 min cannot.
-- **Current goal:** design a new architecture, or merge ideas from recent SOTA, to maximize accuracy on the challenge. Both tracks matter. Open to recent ideas — temporal transformers, 3D / (2+1)D CNNs, pretrained video backbones (VideoMAE, TimeSformer, X3D, V-JEPA, etc.), two-stream, masked modeling, distillation. Surface options with tradeoffs rather than picking unilaterally.
+- **Current goal:** maximise Track 1 accuracy. Open to recent ideas constrained to *no external supervision* — TSM, R(2+1)D / 3D CNNs trained from scratch, temporal transformers, MAE / iBOT / V-JEPA SSL on this dataset's own pixels, two-stream, masked modeling, distillation between in-house models. Surface options with tradeoffs rather than picking unilaterally.
+- **Direction-sensitive labels.** Never apply horizontal or vertical flip in any pipeline (training, SSL, TTA). SSv2 labels distinguish e.g. `Pulling left→right` vs `right→left`; flipping silently mislabels data.
+- **No flip in SSL multi-crop either.** iBOT / DINO / SimCLR default recipes include `RandomHorizontalFlip` in their global and local crop pipelines. **Strip it from every view.** Direction-safe SSL augs only: `RandomResizedCrop`, `ColorJitter`, `GaussianBlur`, `Solarize`, `RandomGrayscale`, `RandomErasing`. Easy to forget when copying upstream code.
 - User background: comfortable with PyTorch; frame explanations accordingly (no need to re-explain basics, but video-specific terminology is worth grounding briefly).
+
+## Per-run protocol
+
+Every training launch must follow this protocol. These rules are non-negotiable.
+
+1. **Pre-run intent note (logged to W&B).** Before kicking off training, draft a short, concise note describing what's being tested and a tiny architecture sketch (ASCII shape diagram, one-line block sequence). Pass it to `wandb.init(notes=..., tags=[...])` so it lands on the run page. Style example:
+
+   ```text
+   exp7_tsm_r18: TSM(λ=0.25) on R18 from scratch, 4 frames, no flip.
+   (B,4,3,224,224) → R18+TSM blocks → GAP_t → FC(33)
+   ```
+
+   Keep it under ~5 lines. The point is to make the W&B run self-explanatory months later.
+
+2. **Robustness — every long run must survive reboot / `tmux kill` / SSH drop.**
+   - Wrap the launch in `tmux new -s <run_name> "<cmd> 2>&1 | tee <run_name>.log"`.
+   - Pass a stable `wandb.run_id` (e.g. `wandb.run_id=<run_name>_v1`) so a relaunch resumes the same W&B record instead of creating a duplicate.
+   - Save **two** checkpoints periodically (every epoch or every N steps): `checkpoints/<run>/last.pt` (overwritten) and `checkpoints/<run>/best.pt` (best val). Training entry point must accept `training.resume_path=...` and pick up optimizer + scheduler + epoch + RNG state, not just weights.
+   - On unexpected exit, the standard recovery is: `tmux new -s <run_name> "<cmd> training.resume_path=checkpoints/<run>/last.pt wandb.run_id=<same_id> 2>&1 | tee -a <run_name>.log"`.
+   - If the current `train.py` doesn't yet support resume + W&B run_id, that gap is a blocker for any new long run — flag it and fix before launching.
+
+3. **Monitor regularly.** During long runs, periodically (every 10–30 min for active sessions) check `tmux ls`, `nvidia-smi`, the live tail of `<run>.log`, and the W&B loss/val-acc curves. Don't fire-and-forget. If loss is flat/diverging or GPU util has dropped to 0, intervene rather than waiting for the run to finish.
+
+4. **End-of-run interpretation.** When a run finishes (planned epochs, early stop, or aborted), write 2–3 concise lines in chat: did it learn, where it plateaued, what the next lever is. No standalone report files; this lives in the conversation and on the W&B run page (paste the same note as a final W&B comment if non-trivial).
+
+5. **Always finish with a submission.** After a run yields a usable checkpoint, run `python src/create_submission.py training.checkpoint_path=checkpoints/<run>/best.pt dataset.submission_output=submissions/<run>.csv` and report the CSV path in chat. One submission per meaningful run, named after the run.
