@@ -46,13 +46,28 @@ esac
 git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)" || true
 mkdir -p logs
 
-if tmux has-session -t "$EXP" 2>/dev/null; then
-    echo "[launch] tmux session '$EXP' already exists; attach with: tmux attach -t $EXP" >&2
+PID_FILE="logs/${EXP}.pid"
+LOG="logs/${EXP}.log"
+
+# If a previous daemon is still running, refuse to start a second one.
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "[launch] '$EXP' watchdog already running (pid $(cat "$PID_FILE"))." >&2
+    echo "[launch] follow:   tail -f $LOG" >&2
+    echo "[launch] stop:     touch /Data/challenge_sb/STOP && kill \$(cat $PID_FILE) (or kill the python child)" >&2
     exit 1
 fi
 
-tmux new -d -s "$EXP" "bash scripts/train_robust.sh python $SCRIPT experiment=$EXP 2>&1 | tee -a logs/${EXP}.log"
-echo "[launch] launched $SCRIPT (experiment=$EXP) in tmux session '$EXP'"
-echo "[launch] watch:    tmux attach -t $EXP   (Ctrl-b d to detach)"
-echo "[launch] logs:     tail -f logs/${EXP}.log"
-echo "[launch] stop:     touch /Data/challenge_sb/STOP && tmux kill-session -t $EXP"
+# Daemonize via `nohup setsid` so the watchdog survives SSH drop, parent-shell
+# exit, AND tmux-server death (which killed v4 on 2026-05-08). The process
+# becomes a session leader with no controlling terminal.
+nohup setsid bash -c "exec bash scripts/train_robust.sh python $SCRIPT experiment=$EXP" \
+    >> "$LOG" 2>&1 < /dev/null &
+DAEMON_PID=$!
+disown "$DAEMON_PID" 2>/dev/null || true
+echo "$DAEMON_PID" > "$PID_FILE"
+
+echo "[launch] launched $SCRIPT (experiment=$EXP) as daemon pid $DAEMON_PID"
+echo "[launch] follow:   tail -f $LOG"
+echo "[launch] check:    ps -fp \$(cat $PID_FILE)   # watchdog"
+echo "[launch] stop:     touch /Data/challenge_sb/STOP   # blocks the NEXT retry only; current python run keeps going"
+echo "[launch] kill:     touch /Data/challenge_sb/STOP && pkill -f 'src/${SCRIPT##*/}.*experiment=$EXP'   # halt now"
