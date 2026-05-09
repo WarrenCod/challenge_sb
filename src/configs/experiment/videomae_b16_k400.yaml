@@ -1,0 +1,43 @@
+# @package _global_
+# Track-2: VideoMAE ViT-B/16 K400-pretrained, fine-tuned on the challenge clips.
+#
+# Why this recipe vs the existing DINOv2 v4:
+#   - DINOv2 v4 = per-frame CLS pooling + temporal transformer over T=4 tokens.
+#     Loses inter-frame motion until the very last 2 layers.
+#   - VideoMAE = joint space-time attention from the first block. Tubelet (2,16,16)
+#     means even with 4 frames the model sees temporal structure natively, and
+#     the K400 self-supervised pretrain gives it a strong motion prior — exactly
+#     what we need for SSv2-style (direction-sensitive) classes.
+#
+# Recipe lifted from VideoMAE fine-tuning defaults, adapted for our 24 GB / 4-frame
+# regime: AdamW + LLRD 0.75, mixup 0.2 (no cutmix — destroys motion cues),
+# label smoothing 0.1, EMA, no horizontal/vertical flip (SSv2 is direction-sensitive).
+defaults:
+  - override /model: videomae_b16_k400
+
+dataset:
+  num_frames: 4
+
+training:
+  optimizer: adamw
+  batch_size: 32              # ~10 GiB peak at S=320; doubles step batch vs default
+  num_workers: 8
+  lr: 7e-4                    # ~sqrt-scaled from 5e-4 @ batch=16
+  llrd: 0.75
+  epochs: 40
+  weight_decay: 0.05
+  warmup_epochs: 3
+  grad_clip: 1.0
+  amp: true
+  mixup_alpha: 0.2
+  label_smoothing: 0.1
+  strong_clip_aug: true       # RandAugment etc. (no flip — SSv2-safe)
+  ema_decay: 0.9998
+  checkpoint_path: ${hydra:runtime.cwd}/best_videomae_b16_k400.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  project: csc43m04ep
+  run_name: videomae-b16-k400
+  tags: [track2, pretrained, videomae, vit_b16, joint_st]

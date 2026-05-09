@@ -1,0 +1,14 @@
+# @package _global_
+# VideoMAE ViT-B/16, K400 self-supervised pretrain (HuggingFace MCG-NJU/videomae-base).
+# Joint space-time attention with tubelet (2,16,16): 4 frames @ 224 -> 392 tokens.
+# Self-supervised pretrain (not K400 supervised) avoids any class-bias leak.
+model:
+  name: videomae
+  num_classes: ${num_classes}
+  hf_id: MCG-NJU/videomae-base
+  pretrained: true
+  image_size: 320          # K400 pretrain was 14x14 patch grid; 20x20 here.
+                           # Sinusoidal pos embeds interpolate; small object motion
+                           # in SSv2-style data benefits from the extra spatial detail.
+  drop_path: 0.1
+  head_dropout: 0.2

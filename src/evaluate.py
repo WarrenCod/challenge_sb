@@ -59,9 +59,13 @@ def main(cfg: DictConfig) -> None:
     raw: Dict[str, Any] = torch.load(checkpoint_path, map_location=device)
     model = load_model_from_checkpoint(raw, device)
 
-    # Normalization must match how the checkpoint was trained (ImageNet stats if pretrained).
+    # Normalization + resolution must match how the checkpoint was trained.
     pretrained_used = bool(raw.get("pretrained", cfg.model.pretrained))
-    eval_transform = build_transforms(is_training=False, use_imagenet_norm=pretrained_used)
+    saved_cfg = raw.get("config") or {}
+    image_size = int(saved_cfg.get("model", {}).get("image_size", 224))
+    eval_transform = build_transforms(
+        is_training=False, use_imagenet_norm=pretrained_used, image_size=image_size,
+    )
 
     val_dir = Path(cfg.dataset.val_dir).resolve()
     val_samples = collect_video_samples(val_dir)

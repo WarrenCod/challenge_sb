@@ -170,7 +170,11 @@ def main(cfg: DictConfig) -> None:
 
     num_frames = int(ckpt.get("num_frames", cfg.dataset.num_frames))
     pretrained = bool(ckpt.get("pretrained", cfg.model.pretrained))
-    eval_transform = build_transforms(is_training=False, use_imagenet_norm=pretrained)
+    saved_cfg = ckpt.get("config") or {}
+    image_size = int(saved_cfg.get("model", {}).get("image_size", 224))
+    eval_transform = build_transforms(
+        is_training=False, use_imagenet_norm=pretrained, image_size=image_size,
+    )
 
     test_root = Path(cfg.dataset.test_dir).resolve()
     output_path = Path(cfg.dataset.submission_output).resolve()

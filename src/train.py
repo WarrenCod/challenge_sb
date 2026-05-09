@@ -32,6 +32,7 @@ from models.cmt import CMT
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.modular import build_modular_model
+from models.videomae import VideoMAEClassifier
 from utils import (
     ModelEMA,
     atomic_torch_save,
@@ -66,6 +67,16 @@ def build_model(cfg: DictConfig) -> nn.Module:
         )
     if name == "modular":
         return build_modular_model(cfg.model, num_classes=num_classes)
+    if name == "videomae":
+        return VideoMAEClassifier(
+            num_classes=num_classes,
+            hf_id=str(cfg.model.get("hf_id", "MCG-NJU/videomae-base")),
+            pretrained=bool(cfg.model.pretrained),
+            num_frames=int(cfg.dataset.num_frames),
+            image_size=int(cfg.model.get("image_size", 224)),
+            drop_path=float(cfg.model.get("drop_path", 0.1)),
+            head_dropout=float(cfg.model.get("head_dropout", 0.2)),
+        )
     if name == "cmt":
         return CMT(
             num_classes=num_classes,
@@ -239,11 +250,12 @@ def main(cfg: DictConfig) -> None:
         use_imagenet_norm = bool(cfg.model.spatial.get("pretrained", False))
     else:
         use_imagenet_norm = bool(cfg.model.get("pretrained", False))
+    input_image_size = int(cfg.model.get("image_size", 224))
     train_transform = build_transforms(
-        is_training=True, use_imagenet_norm=use_imagenet_norm
+        is_training=True, use_imagenet_norm=use_imagenet_norm, image_size=input_image_size,
     )
     eval_transform = build_transforms(
-        is_training=False, use_imagenet_norm=use_imagenet_norm
+        is_training=False, use_imagenet_norm=use_imagenet_norm, image_size=input_image_size,
     )
 
     # Strong clip-aware augmentation (RandomResizedCrop + ColorJitter + RandAugment +
@@ -252,7 +264,7 @@ def main(cfg: DictConfig) -> None:
     use_strong_aug = bool(cfg.training.get("strong_clip_aug", False))
     if use_strong_aug:
         train_clip_transform = build_strong_clip_transform(
-            image_size=224, use_imagenet_norm=use_imagenet_norm
+            image_size=input_image_size, use_imagenet_norm=use_imagenet_norm
         )
         train_dataset = VideoFrameDataset(
             root_dir=train_dir,
