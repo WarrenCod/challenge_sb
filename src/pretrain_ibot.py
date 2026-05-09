@@ -138,11 +138,26 @@ class iBOTLoss(nn.Module):
         dino_loss = dino_loss / max(1, n_pairs)
 
         # --- MIM loss (only at masked positions of the global crops) ---
-        teacher_patch_softmax = F.softmax((teacher_patch - self.center_patch) / teacher_temp, dim=-1).detach()
-        student_patch_log = F.log_softmax(student_patch / self.student_temp, dim=-1)
-        mim_per = -(teacher_patch_softmax * student_patch_log).sum(dim=-1)        # (n_global*B, N)
-        mask_f = masks.float()
-        mim_loss = (mim_per * mask_f).sum() / mask_f.sum().clamp(min=1.0)
+        # Index FIRST, softmax SECOND. Naïvely doing softmax over the full
+        # (2B, N, D) tensor allocates ~D / mask_ratio bytes more than needed
+        # — at D=8192, B=128, N=196 that's the 1.5 GiB tensor that OOMs the
+        # backward pass on a 24 GiB A5000. Selecting masked rows first turns
+        # both the forward tensor and the autograd-saved tensor into
+        # (M, D) where M ≈ mean_mask_ratio · 2B · N, ~3× smaller and well
+        # within budget. Math is identical (softmax is row-wise).
+        mask_bool = masks.bool()
+        teacher_patch_masked = teacher_patch[mask_bool]                 # (M, D)
+        student_patch_masked = student_patch[mask_bool]                 # (M, D)
+        center_patch_2d = self.center_patch.view(1, -1)                 # (1, D)
+        teacher_patch_softmax = F.softmax(
+            (teacher_patch_masked - center_patch_2d) / teacher_temp, dim=-1
+        ).detach()
+        student_patch_log = F.log_softmax(student_patch_masked / self.student_temp, dim=-1)
+        mim_per = -(teacher_patch_softmax * student_patch_log).sum(dim=-1)  # (M,)
+        if mim_per.numel() == 0:
+            mim_loss = student_patch.sum() * 0.0  # keep grad graph, value 0
+        else:
+            mim_loss = mim_per.mean()
 
         total = dino_loss + self.mim_weight * mim_loss
 

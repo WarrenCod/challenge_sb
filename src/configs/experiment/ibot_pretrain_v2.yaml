@@ -49,7 +49,10 @@ training:
   warmup_teacher_temp_epochs: 50
   student_temp: 0.1
   center_momentum: 0.9
-  mim_weight: 1.0
+  mim_weight: 0.3               # was 1.0; lowered after ep ~22-29 MIM divergence
+                                # (DINO loss kept falling, MIM rose 3.31→4.91)
+                                # — separate-head iBOT failure mode, fix is to
+                                # down-weight MIM so patch and cls dynamics stay coupled.
   freeze_last_layer_epochs: 1
   checkpoint_path: ${hydra:runtime.cwd}/checkpoints/ibot_stage1.pt
   snapshot_every: 25

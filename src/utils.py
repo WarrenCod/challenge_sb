@@ -227,6 +227,7 @@ _RESUME_HASH_HARMLESS = {
     ("training", "checkpoint_path"),
     ("training", "snapshot_every"),
     ("training", "resume"),
+    ("training", "mim_weight"),
 }
 
 
