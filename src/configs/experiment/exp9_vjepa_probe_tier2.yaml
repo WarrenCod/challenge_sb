@@ -1,0 +1,33 @@
+# @package _global_
+# exp9-tier2 (Track 1, diagnostic): frozen V-JEPA Tier-2 encoder + linear probe.
+# Same recipe as exp9_vjepa_probe but pointed at the tubelet (Tier-2) ckpt.
+# A/B vs Tier-1 probe tells us whether the tubelet tokenization actually
+# improves linear separability — go/no-go before sinking GPU into Stage 2.
+defaults:
+  - override /model: vit_vjepa_probe_tier2
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 32
+  lr: 1.0e-3
+  llrd: 0.0
+  epochs: 20
+  warmup_epochs: 2
+  weight_decay: 1.0e-4
+  label_smoothing: 0.1
+  mixup_alpha: 0.0
+  strong_clip_aug: false
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema: false
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp9_vjepa_probe_tier2.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: exp9_vjepa_probe_tier2
+  tags: [track1, diagnostic, vjepa, tier2, linear-probe, frozen-encoder]

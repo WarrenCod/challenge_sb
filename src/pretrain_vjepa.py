@@ -127,6 +127,9 @@ def main(cfg: DictConfig) -> None:
         predictor_heads=int(cfg.vjepa.predictor_heads),
         num_frames=int(cfg.vjepa.num_frames),
         loss_beta=float(cfg.training.loss_beta),
+        mask_ratio=float(cfg.vjepa.get("mask_ratio", 0.75)),
+        mask_n_blocks=int(cfg.vjepa.get("mask_n_blocks", 3)),
+        tubelet_size=int(cfg.vjepa.get("tubelet_size", 1)),
     ).to(device)
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6

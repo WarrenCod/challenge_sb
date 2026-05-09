@@ -1,0 +1,23 @@
+# @package _global_
+# Frozen-encoder linear probe on V-JEPA Stage-1 features.
+# Encoder: V-JEPA ViT-S/16, pool=mean_patches (drops CLS, mean over patches).
+# Temporal: mean over T (no learned params).
+# Classifier: a single Linear(384, 33).
+# Total trainable params ≈ 12.7k. The probe is a clean read on whether the
+# patch features are linearly separable into the 33 action classes — a
+# diagnostic for whether to iterate on Stage-2 head or on Stage-1 pretraining.
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: vit_mae
+    variant: vit_s_16
+    image_size: 224
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1.pt
+    drop_path: 0.0
+    pool: mean_patches
+    freeze: true
+  temporal:
+    name: mean_pool
+  classifier:
+    name: linear

@@ -1,0 +1,43 @@
+# @package _global_
+# exp8 (Track 1): V-JEPA-pretrained ViT-S + joint space-time transformer head.
+# Same V-JEPA Stage-1 dump as exp5/exp5c, but the head reads patch tokens
+# (which V-JEPA actually trained) instead of the encoder's CLS (which it didn't).
+# Recipe matches exp2c (the recipe that lifted MAE+CLS-head from 0.521 → 0.546):
+# strong clip aug, mixup 0.2, drop_path 0.2 (encoder), dropout 0.2 (head),
+# label smoothing 0.1, weight decay 0.05, EMA 0.9999. LLRD 0.75 on the encoder,
+# head at full lr=3e-4. Long schedule (300 ep + 20 warmup) — the head is fresh
+# random init and the encoder's CLS isn't in the loss path, so the head is
+# doing real learning, not refinement.
+#
+# Hard 30-ep gate: kill if val_acc < 0.18 by epoch 30 — at that point either
+# the encoder load is wrong or the head can't separate patch features into
+# 33 classes with this recipe. Don't burn the rest of the schedule.
+defaults:
+  - override /model: vit_vjepa_spacetime
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 16
+  lr: 3.0e-4
+  llrd: 0.75
+  epochs: 300
+  warmup_epochs: 20
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup_alpha: 0.2
+  strong_clip_aug: true
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp8_vjepa_spacetime.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: exp8_vjepa_spacetime
+  tags: [track1, stage2, vjepa, spacetime, joint-attn, regularized, ema, long]

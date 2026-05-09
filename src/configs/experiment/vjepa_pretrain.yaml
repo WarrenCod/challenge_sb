@@ -1,21 +1,39 @@
 # @package _global_
-# Stage 1 — V-JEPA Tier-0 (frame-pair JEPA, bidirectional, narrow predictor).
+# Stage 1 — V-JEPA Tier-1 (multi-frame masked prediction with block masks).
 # Entry point: `python src/pretrain_vjepa.py experiment=vjepa_pretrain`
+#
+# Vs Tier-0 (frame-pair, no mask): the predictor now sees all T frames of
+# context patch tokens with ~75% block-masked positions, and predicts only
+# the masked tokens of the EMA target encoder. Mask is K spatial rectangles
+# lifted across all T frames, so the encoder is forced to produce dense,
+# locally informative features (MAE-style pressure) rather than collapse to
+# temporal smoothness.
+#
 # Saves the EMA target encoder under `encoder_state_dict` in MAE/iBOT key
-# layout, so Stage 2 loads it via the existing ViTMAEEncoder.
+# layout; Stage 2 loads it via the existing ViTMAEEncoder unchanged.
 
 vjepa:
   variant: vit_s_16
   image_size: 224
   patch_size: 16
   num_frames: 4
-  predictor_dim: 128
-  predictor_depth: 4
-  predictor_heads: 4
+  # Wider/deeper predictor — the task is harder now, so the predictor needs
+  # capacity. ViT-S width is 384, predictor at 256 gives a reasonable bottleneck.
+  predictor_dim: 256
+  predictor_depth: 6
+  predictor_heads: 8
+  # Block masking on (H, W) lifted across T frames.
+  mask_ratio: 0.75
+  mask_n_blocks: 3
 
 training:
+  # Tier-1 v2 (2026-05-07): the previous run plateaued at epoch 57 then drifted
+  # (loss ↑, tgt_std ↑) and a frozen linear probe landed at ~7% — well below
+  # the 10.5% bar. Diagnosis: target encoder drifting under the student because
+  # EMA momentum was too low and effective lr too high for batch_size=64.
+  # Fix: stiffer EMA + halved base_lr + commit to a single 200-epoch cosine.
   batch_size: 256
-  base_lr: 1.5e-4               # effective lr = base_lr * batch_size / 256
+  base_lr: 7.5e-5               # effective lr = base_lr * batch_size / 256
   final_lr: 1.0e-6
   weight_decay: 0.05
   warmup_epochs: 10
@@ -23,7 +41,7 @@ training:
   amp: true                     # bf16 on the A5000 (no GradScaler needed)
   num_workers: 8
   grad_clip: 3.0
-  ema_momentum_start: 0.996
+  ema_momentum_start: 0.998
   ema_momentum_end: 1.0
   loss_beta: 2.0
   checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1.pt
@@ -40,4 +58,4 @@ training:
 
 wandb:
   enabled: true
-  tags: [track1, stage1, vjepa]
+  tags: [track1, stage1, vjepa, masked, multi-frame]

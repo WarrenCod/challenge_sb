@@ -34,6 +34,7 @@ from models.temporal.diff_transformer import DiffTransformerTemporal
 from models.temporal.dual_stream_transformer import DualStreamTransformerTemporal
 from models.temporal.lstm import LSTMTemporal
 from models.temporal.mean_pool import MeanPoolTemporal
+from models.temporal.spacetime import SpaceTimeTransformer
 from models.temporal.transformer import TransformerTemporal
 
 try:
@@ -56,6 +57,7 @@ TEMPORAL_REGISTRY: Dict[str, type] = {
     "transformer": TransformerTemporal,
     "diff_transformer": DiffTransformerTemporal,
     "dual_stream_transformer": DualStreamTransformerTemporal,
+    "spacetime": SpaceTimeTransformer,
 }
 CLASSIFIER_REGISTRY: Dict[str, type] = {
     "linear": LinearClassifier,
@@ -171,7 +173,17 @@ def build_modular_model(
     cfg: Mapping[str, Any], num_classes: int
 ) -> ModularVideoModel:
     spatial = build_spatial(cfg["spatial"])
-    temporal = build_temporal(cfg["temporal"], in_dim=spatial.out_dim)
+    # SpaceTimeTransformer needs num_patches; auto-inject from the spatial encoder
+    # so the YAML doesn't have to restate img_size/patch_size.
+    temporal_cfg = _to_plain(cfg["temporal"])
+    if temporal_cfg.get("name") == "spacetime" and "num_patches" not in temporal_cfg:
+        if not hasattr(spatial, "num_patches"):
+            raise ValueError(
+                "temporal.name=spacetime requires a spatial encoder exposing num_patches "
+                "(e.g. vit_mae)."
+            )
+        temporal_cfg["num_patches"] = int(spatial.num_patches)
+    temporal = build_temporal(temporal_cfg, in_dim=spatial.out_dim)
     classifier = build_classifier(
         cfg["classifier"], in_dim=temporal.out_dim, num_classes=num_classes
     )

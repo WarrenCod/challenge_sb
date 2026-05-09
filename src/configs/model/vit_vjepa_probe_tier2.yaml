@@ -1,0 +1,22 @@
+# @package _global_
+# Frozen-encoder linear probe on V-JEPA Tier-2 (tubelet) features.
+# Encoder: V-JEPA Tier-2 ViT-S/16 with tubelet=2 (joint space-time).
+# Pool=mean_patches: averages spatial patches per temporal token, returns
+# (B, T_tok=2, D). Temporal head means over T_tok. Classifier: Linear(384, 33).
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: vit_mae
+    variant: vit_s_16
+    image_size: 224
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1_tier2.pt
+    drop_path: 0.0
+    pool: mean_patches
+    freeze: true
+    tubelet_size: 2
+    num_frames: 4
+  temporal:
+    name: mean_pool
+  classifier:
+    name: linear

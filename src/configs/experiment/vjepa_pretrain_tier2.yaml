@@ -1,0 +1,54 @@
+# @package _global_
+# Stage 1 — V-JEPA Tier-2 (3D-tubelet patches + joint space-time ViT).
+# Entry point: `python src/pretrain_vjepa.py experiment=vjepa_pretrain_tier2`
+#
+# Vs Tier-1 (per-frame 2D patches, predictor-only cross-frame attention):
+# the encoder now sees tubelet tokens (2 frames × 16×16 pixels per patch) so
+# motion features emerge at the token level, and joint space-time attention
+# runs through every block. With T=4 and tubelet=2 the token grid is
+# (T_tok=2, 14, 14) → 392 tokens (vs 784 in Tier-1). Mask is now real 3D
+# blocks (Δt × Δh × Δw) rather than spatial blocks lifted across all time —
+# partial-temporal masks force the predictor to reason temporally instead of
+# inpainting from the unmasked time slice. Encoder/predictor/loss layout
+# otherwise unchanged; ckpts go to `vjepa_stage1_tier2.pt`.
+#
+# Why bet on this over more Tier-1: SSv2-style data is action-defined, and
+# the tubelet tokenization is the standard V-JEPA-2 / VideoMAE move that
+# yields large fine-tune gains on motion-heavy benchmarks.
+
+vjepa:
+  variant: vit_s_16
+  image_size: 224
+  patch_size: 16
+  num_frames: 4
+  tubelet_size: 2
+  predictor_dim: 256
+  predictor_depth: 6
+  predictor_heads: 8
+  mask_ratio: 0.75
+  mask_n_blocks: 3
+
+training:
+  batch_size: 256
+  base_lr: 7.5e-5               # effective lr = base_lr * batch_size / 256
+  final_lr: 1.0e-6
+  weight_decay: 0.05
+  warmup_epochs: 10
+  epochs: 200
+  amp: true
+  num_workers: 8
+  grad_clip: 3.0
+  ema_momentum_start: 0.998
+  ema_momentum_end: 1.0
+  loss_beta: 2.0
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1_tier2.pt
+  device: cuda
+  max_nonfinite_streak: 50
+  early_stop_patience: 25
+  early_stop_min_delta: 1.0e-4
+  early_stop_min_epochs: 60
+
+wandb:
+  enabled: true
+  run_name: vjepa_stage1_tier2
+  tags: [track1, stage1, vjepa, tier2, tubelet, spacetime]

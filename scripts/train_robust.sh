@@ -27,10 +27,24 @@
 set -u
 STOP_FILE="${STOP_FILE:-/Data/challenge_sb/STOP}"
 SLEEP_AFTER_FAIL="${SLEEP_AFTER_FAIL:-30}"
+REPO_ROOT="${REPO_ROOT:-/Data/challenge_sb}"
+VENV_ACTIVATE="${VENV_ACTIVATE:-$REPO_ROOT/.venv/bin/activate}"
 
 if [ "$#" -lt 1 ]; then
     echo "usage: $0 <command...>" >&2
     exit 64
+fi
+
+# Auto-activate the project venv if available. This is critical for @reboot/cron
+# launches, which inherit a minimal PATH that does NOT include .venv/bin — without
+# activation, `python` would resolve to system python (no torch) and the watchdog
+# would loop the same import error forever.
+if [ -f "$VENV_ACTIVATE" ]; then
+    # shellcheck disable=SC1090
+    . "$VENV_ACTIVATE"
+    echo "[robust] activated venv: $(command -v python)"
+else
+    echo "[robust] WARNING: no venv at $VENV_ACTIVATE; using \$PATH python ($(command -v python || echo 'none'))" >&2
 fi
 
 while true; do

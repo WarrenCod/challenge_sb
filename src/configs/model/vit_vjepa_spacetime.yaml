@@ -1,0 +1,26 @@
+# @package _global_
+# V-JEPA Stage-1 ViT-S/16 (patch tokens) + 4-layer joint space-time transformer.
+# Reads patch tokens, not CLS — V-JEPA's pretraining objective trains patches,
+# not CLS, so the CLS-only head used by exp5/exp5c is mismatched. This head
+# fixes that by attending jointly over T*N patch tokens with a fresh learned
+# [CLS_st] for classification.
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: vit_mae
+    variant: vit_s_16
+    image_size: 224
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1.pt
+    drop_path: 0.2
+    pool: tokens
+  temporal:
+    name: spacetime
+    num_heads: 6           # ViT-S width / 64
+    num_layers: 4
+    dim_feedforward: 1536  # 4 * embed_dim
+    dropout: 0.2
+    drop_path: 0.1
+    max_frames: 8
+  classifier:
+    name: linear

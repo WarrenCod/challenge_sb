@@ -47,6 +47,31 @@ def _sincos_2d_posembed(d: int, grid_size: int, cls_token: bool = True) -> torch
     return pe.unsqueeze(0)  # (1, N+1, d)
 
 
+def _sincos_3d_posembed(d: int, t_tokens: int, grid_size: int, cls_token: bool = True) -> torch.Tensor:
+    """3D sin-cos pos-embed, factorized as 2D-spatial + 1D-temporal (summed).
+
+    Output: (1, cls + t_tokens * grid_size**2, d). Order: temporal-major
+    (slice 0 patches, slice 1 patches, ...). VideoMAE / V-JEPA-2 style.
+    """
+    assert d % 4 == 0, "d must be divisible by 4"
+    spat = _sincos_2d_posembed(d, grid_size, cls_token=False).squeeze(0)  # (N_sp, d)
+
+    pos_t = torch.arange(t_tokens, dtype=torch.float32)
+    omega = torch.arange(d // 2, dtype=torch.float32) / (d / 2.0)
+    omega = 1.0 / (10000 ** omega)
+    out = pos_t[:, None] * omega[None, :]  # (T, d/2)
+    temp = torch.cat([torch.sin(out), torch.cos(out)], dim=1)  # (T, d)
+
+    n_sp = grid_size * grid_size
+    spat_3d = spat.unsqueeze(0).expand(t_tokens, -1, -1)        # (T, N_sp, d)
+    temp_3d = temp.unsqueeze(1).expand(-1, n_sp, -1)             # (T, N_sp, d)
+    pe = (spat_3d + temp_3d).reshape(t_tokens * n_sp, d)         # (T*N_sp, d)
+
+    if cls_token:
+        pe = torch.cat([torch.zeros(1, d), pe], dim=0)
+    return pe.unsqueeze(0)  # (1, cls + T*N_sp, d)
+
+
 class PatchEmbed(nn.Module):
     """Conv-based patch embedding, mirrors timm/MAE."""
 

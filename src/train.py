@@ -9,8 +9,10 @@ Run from the ``src/`` directory (so ``configs/`` resolves)::
 Pick an **experiment** under ``configs/experiment/`` (each one selects a model and can
 add more overrides). You can still override any key, e.g. ``model.pretrained=false``.
 
-Training uses ``dataset.train_dir`` and ``split_train_val`` for an internal train/val
-split; the dedicated ``dataset.val_dir`` is for ``evaluate.py`` only.
+Training reads ``dataset.train_dir`` for the train set and ``dataset.val_dir`` for the
+held-out validation set; ``val/acc`` and best-checkpoint selection both run on
+``val_dir`` so they reflect the leaderboard test distribution rather than a leaky
+in-train hold-out.
 """
 
 from __future__ import annotations
@@ -48,7 +50,6 @@ from utils import (
     mixup_batch,
     restore_rng_state,
     set_seed,
-    split_train_val,
     wandb_log,
 )
 
@@ -252,23 +253,31 @@ def main(cfg: DictConfig) -> None:
     device = torch.device(device_str)
 
     train_dir = Path(cfg.dataset.train_dir).resolve()
-    all_samples = collect_video_samples(train_dir)
-
-    # Keep only class folders whose names match the validation split — train/ contains
-    # 23 extra folders under an older numeric scheme that duplicate canonical clips
-    # under wrong labels; leaving them in poisons the CE signal.
     val_dir = Path(cfg.dataset.val_dir).resolve()
+    if train_dir == val_dir:
+        raise ValueError(f"train_dir and val_dir must differ; both point at {train_dir}")
+
+    # Train: collect from train_dir, then drop the 23 extra folders that use an
+    # older numeric scheme and duplicate canonical clips under the wrong labels.
+    # The canonical class set is the folder names actually used in val_dir.
     canonical_classes = {p.name for p in val_dir.iterdir() if p.is_dir()}
-    all_samples = [s for s in all_samples if s[0].parent.name in canonical_classes]
+    train_samples = [
+        s for s in collect_video_samples(train_dir)
+        if s[0].parent.name in canonical_classes
+    ]
+
+    # Val: the held-out set. Drives val/acc and best-checkpoint selection so the
+    # selector aligns with the leaderboard distribution.
+    val_samples = collect_video_samples(val_dir)
 
     max_samples = cfg.dataset.get("max_samples")
     if max_samples is not None:
-        all_samples = all_samples[: int(max_samples)]
+        train_samples = train_samples[: int(max_samples)]
+        val_samples = val_samples[: int(max_samples)]
 
-    train_samples, val_samples = split_train_val(
-        all_samples,
-        val_ratio=float(cfg.dataset.val_ratio),
-        seed=int(cfg.dataset.seed),
+    print(
+        f"[train] train_dir={train_dir} ({len(train_samples)} clips) | "
+        f"val_dir={val_dir} ({len(val_samples)} clips)"
     )
 
     # Match normalization to pretrained flag (ImageNet stats when using pretrained weights).
@@ -305,7 +314,7 @@ def main(cfg: DictConfig) -> None:
             sample_list=train_samples,
         )
     val_dataset = VideoFrameDataset(
-        root_dir=train_dir,
+        root_dir=val_dir,
         num_frames=int(cfg.dataset.num_frames),
         transform=eval_transform,
         sample_list=val_samples,

@@ -1,0 +1,48 @@
+# @package _global_
+# exp9 (Track 1, diagnostic): frozen V-JEPA encoder + linear probe.
+# Reads patch-pooled features from V-JEPA Stage-1, mean-pools over time, runs
+# them through a single Linear(384, 33). Encoder is frozen and in eval-mode
+# (drop_path=0, no aug, no mixup, no EMA) so the result is a clean measure
+# of the patch features' linear separability into the 33 action classes.
+#
+# How to read the result:
+#   probe val/best >= 0.45  -> features are good; iterate Stage-2 head/recipe.
+#   probe val/best <= 0.30  -> features are weak; iterate Stage-1 (CLS aux loss
+#                              first, then multi-block masking).
+#   in between (0.30-0.45)  -> mixed; both levers worth pulling.
+#
+# Compares to (rough) reference points elsewhere in the codebase:
+#   exp2  MAE + CLS head (no reg)        -> 0.521 fine-tuned
+#   exp2b MAE + CLS head + reg stack     -> 0.546 fine-tuned
+#   exp5  V-JEPA + CLS head (mismatch)   -> 0.352 fine-tuned (head wrong)
+# A frozen-encoder linear probe is a strict lower bound on what fine-tuning
+# can extract — interpret the number relative to where MAE's probe would
+# land (TBD; can run the same probe on mae_stage1.pt for an A/B).
+defaults:
+  - override /model: vit_vjepa_probe
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 32
+  lr: 1.0e-3
+  llrd: 0.0
+  epochs: 20
+  warmup_epochs: 2
+  weight_decay: 1.0e-4
+  label_smoothing: 0.1
+  mixup_alpha: 0.0
+  strong_clip_aug: false
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema: false
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp9_vjepa_probe.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: exp9_vjepa_probe
+  tags: [track1, diagnostic, vjepa, linear-probe, frozen-encoder]

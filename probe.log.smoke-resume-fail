@@ -1,0 +1,82 @@
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /users/eleves-a/2024/stanislas.mischler/.netrc.
+wandb: Currently logged in as: stan-mischler (stan-mischler-cole-polytechnique) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run e8j9ze8s
+wandb: Tracking run with wandb version 0.26.1
+wandb: Run data is saved locally in /Data/challenge_sb/wandb/run-20260507_175810-e8j9ze8s
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run exp9_vjepa_probe
+wandb: ⭐️ View project at https://wandb.ai/stan-mischler-cole-polytechnique/csc43m04ep
+wandb: 🚀 View run at https://wandb.ai/stan-mischler-cole-polytechnique/csc43m04ep/runs/e8j9ze8s
+num_classes: 33
+wandb:
+  enabled: true
+  project: csc43m04ep
+  entity: null
+  mode: online
+  run_name: exp9_vjepa_probe
+  run_id: null
+  tags:
+  - track1
+  - diagnostic
+  - vjepa
+  - linear-probe
+  - frozen-encoder
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: vit_mae
+    variant: vit_s_16
+    image_size: 224
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1.pt
+    drop_path: 0.0
+    pool: mean_patches
+    freeze: true
+  temporal:
+    name: mean_pool
+  classifier:
+    name: linear
+dataset:
+  train_dir: ${hydra:runtime.cwd}/processed_data/train
+  val_dir: ${hydra:runtime.cwd}/processed_data/val
+  test_dir: ${hydra:runtime.cwd}/processed_data/test
+  submission_output: ${hydra:runtime.cwd}/processed_data/submission.csv
+  num_frames: 4
+  val_ratio: 0.2
+  seed: 42
+  max_samples: null
+training:
+  batch_size: 32
+  lr: 0.001
+  epochs: 20
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp9_vjepa_probe.pt
+  device: cuda
+  amp: true
+  weight_decay: 0.0001
+  warmup_epochs: 2
+  grad_clip: 1.0
+  resume: true
+  llrd: 0.0
+  label_smoothing: 0.1
+  mixup_alpha: 0.0
+  strong_clip_aug: false
+  amp_dtype: bf16
+  ema: false
+
+[train] train_dir=/Data/challenge_sb/processed_data/train (44993 clips) | val_dir=/Data/challenge_sb/processed_data/val (6745 clips)
+[vit_mae] loaded encoder from /Data/challenge_sb/checkpoints/vjepa_stage1.pt
+[train] found resume file: /Data/challenge_sb/checkpoints/exp9_vjepa_probe_last.pt
+Error executing job with overrides: ['experiment=exp9_vjepa_probe']
+Traceback (most recent call last):
+  File "/Data/challenge_sb/src/train.py", line 449, in main
+    raise RuntimeError(
+RuntimeError: Resume aborted: config hash mismatch.
+  saved:   9c082fde9825d6c7
+  current: 9d474a620d7fe8b7
+To start fresh, either delete /Data/challenge_sb/checkpoints/exp9_vjepa_probe_last.pt or pass training.resume=false.
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mexp9_vjepa_probe[0m at: [34mhttps://wandb.ai/stan-mischler-cole-polytechnique/csc43m04ep/runs/e8j9ze8s[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/run-20260507_175810-e8j9ze8s/logs[0m

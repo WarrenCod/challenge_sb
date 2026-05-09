@@ -1,0 +1,49 @@
+# @package _global_
+# exp5c (Track 1): V-JEPA-pretrained ViT-S + 2-layer temporal transformer head
+# under the exp2c regularization stack (drop_path 0.2, temporal dropout 0.2,
+# mixup 0.2, strong_clip_aug, EMA 0.9999, 100 epochs / 8 warmup, lr 3e-4,
+# llrd 0.75). Identical to exp2c except for the spatial init — `vjepa_stage1.pt`
+# instead of the MAE Stage-1 dump. The single varied axis vs exp2c is encoder
+# pretraining; the residual val/best delta is the clean measurement of how
+# V-JEPA stacks up against MAE on this head + data.
+#
+# Why this recipe (vs exp5's): exp5 used the exp3/iBOT recipe (lr 5e-4 /
+# llrd 0.65, no aug stack, no EMA, 50 ep) and overfit massively
+# (train 0.6374 / val 0.3505, gap +28.7 pp). exp2 → exp2b shows the same
+# pathology dissolves under this regularization stack on the same head + data;
+# exp2c then adds EMA + 2× schedule for another ~+1–2 pp.
+defaults:
+  - override /model: vit_mae_transformer
+
+model:
+  spatial:
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1.pt
+    drop_path: 0.2
+  temporal:
+    dropout: 0.2
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 16
+  lr: 3.0e-4
+  llrd: 0.75
+  epochs: 100
+  warmup_epochs: 8
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup_alpha: 0.2
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp5c_vjepa_transformer.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: exp5c_vjepa_transformer
+  tags: [track1, stage2, vjepa, transformer, regularized, ema, long]
