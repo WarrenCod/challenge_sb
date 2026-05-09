@@ -34,6 +34,7 @@ from models.temporal.diff_transformer import DiffTransformerTemporal
 from models.temporal.dual_stream_transformer import DualStreamTransformerTemporal
 from models.temporal.lstm import LSTMTemporal
 from models.temporal.mean_pool import MeanPoolTemporal
+from models.temporal.spacetime_transformer import SpaceTimeTransformer
 from models.temporal.transformer import TransformerTemporal
 
 try:
@@ -56,6 +57,7 @@ TEMPORAL_REGISTRY: Dict[str, type] = {
     "transformer": TransformerTemporal,
     "diff_transformer": DiffTransformerTemporal,
     "dual_stream_transformer": DualStreamTransformerTemporal,
+    "spacetime_transformer": SpaceTimeTransformer,
 }
 CLASSIFIER_REGISTRY: Dict[str, type] = {
     "linear": LinearClassifier,
@@ -89,17 +91,27 @@ class ModularVideoModel(nn.Module):
         self.aux_head: nn.Module | None = None  # optional per-frame deep-supervision head
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
-        frame_features = self.spatial(video)       # (B, T, d)
-        video_vector = self.temporal(frame_features)  # (B, d')
-        return self.classifier(video_vector)       # (B, num_classes)
+        if getattr(self.temporal, "wants_tokens", False):
+            tokens = self.spatial.forward_tokens(video)   # (B, T, H, W, d)
+            video_vector = self.temporal(tokens)          # (B, d')
+        else:
+            frame_features = self.spatial(video)          # (B, T, d)
+            video_vector = self.temporal(frame_features)  # (B, d')
+        return self.classifier(video_vector)              # (B, num_classes)
 
     def forward_with_aux(self, video: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # Returns (main_logits (B, K), aux_logits (B, T, K)).
         # Only valid when self.aux_head is set; train.py guards the call.
-        frame_features = self.spatial(video)            # (B, T, d)
-        video_vector = self.temporal(frame_features)    # (B, d')
-        main_logits = self.classifier(video_vector)     # (B, K)
-        aux_logits = self.aux_head(frame_features)      # (B, T, K)
+        if getattr(self.temporal, "wants_tokens", False):
+            tokens = self.spatial.forward_tokens(video)   # (B, T, H, W, d)
+            video_vector = self.temporal(tokens)          # (B, d')
+            # Aux head sees per-frame globally-pooled spatial features.
+            frame_features = tokens.mean(dim=(2, 3))      # (B, T, d)
+        else:
+            frame_features = self.spatial(video)          # (B, T, d)
+            video_vector = self.temporal(frame_features)  # (B, d')
+        main_logits = self.classifier(video_vector)       # (B, K)
+        aux_logits = self.aux_head(frame_features)        # (B, T, K)
         return main_logits, aux_logits
 
 

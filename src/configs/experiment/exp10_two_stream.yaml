@@ -1,0 +1,52 @@
+# @package _global_
+# Exp10 (Track 1): RGB + optical-flow two-stream.
+#
+# Hot-starts the RGB stream from exp9's checkpoint (val_acc 0.5838) so we don't
+# spend compute relearning what's already saturated. Flow stream (TSM-R18,
+# 2-channel input) trains from scratch on Farneback dx/dy. Single learnable
+# scalar gate (sigmoid) fuses logits; modality dropout 0.1 each direction
+# regularizes the fusion.
+#
+# Recipe largely mirrors exp9: AdamW, cosine schedule, mixup 0.2, LS 0.1, EMA,
+# aux per-frame loss weight 0.3 mirrored on each stream. RandAugment is dropped
+# (its geometric ops would mis-align flow vs RGB); the strong-aug pipeline here
+# is RRC + ColorJitter + RandomErasing only (built into FlowAwareClipAug).
+#
+# LR layout:
+#   - RGB backbone (rgb_model.spatial.*): backbone_lr=2.0e-4 (hot-started, slow)
+#   - Flow backbone + heads + gate:        head_lr=5.0e-4    (fresh, faster)
+
+defaults:
+  - override /model: two_stream_tsm
+
+dataset:
+  num_frames: 4
+  image_size: 256
+
+training:
+  optimizer: adamw
+  lr: 5.0e-4
+  backbone_lr: 2.0e-4
+  weight_decay: 0.05
+  batch_size: 16
+  epochs: 120
+  warmup_epochs: 8
+  lr_schedule: cosine
+  label_smoothing: 0.1
+  amp: true
+  grad_clip: 1.0
+  num_workers: 8
+  ema: true
+  ema_decay: 0.9995
+  mixup_alpha: 0.2
+  aux_loss:
+    enabled: true
+    weight: 0.3
+  rgb_init_from_checkpoint: ${hydra:runtime.cwd}/checkpoints/exp9_tsm_r50_mlp_256_long.pt
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp10_two_stream.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: tsm-two-stream-rgb-flow-256
+  tags: [track1, supervised, two_stream, tsm, resnet50, resnet18, flow, fusion, ema, res256]

@@ -66,6 +66,7 @@ class ResNetTSMEncoder(SpatialEncoder):
         num_segments: int = 4,
         fold_div: int = 8,
         pretrained: bool = False,
+        in_channels: int = 3,
     ) -> None:
         super().__init__()
         if variant not in _RESNET_FACTORIES:
@@ -77,6 +78,19 @@ class ResNetTSMEncoder(SpatialEncoder):
         self.out_dim = backbone.fc.in_features
         backbone.fc = nn.Identity()
 
+        if in_channels != 3:
+            # Replace the stem with a fresh conv that matches the new input channel
+            # count. Pretrained weights on a 3-channel stem can't be reused here.
+            old = backbone.conv1
+            backbone.conv1 = nn.Conv2d(
+                in_channels,
+                old.out_channels,
+                kernel_size=old.kernel_size,
+                stride=old.stride,
+                padding=old.padding,
+                bias=old.bias is not None,
+            )
+
         for layer in (backbone.layer1, backbone.layer2, backbone.layer3, backbone.layer4):
             for block in layer:
                 shift = TemporalShift(num_segments=num_segments, fold_div=fold_div)
@@ -84,6 +98,7 @@ class ResNetTSMEncoder(SpatialEncoder):
 
         self.backbone = backbone
         self.num_segments = num_segments
+        self.in_channels = in_channels
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
         b, t, c, h, w = video.shape
@@ -91,6 +106,38 @@ class ResNetTSMEncoder(SpatialEncoder):
             raise RuntimeError(
                 f"Expected T={self.num_segments} frames per clip (TSM is wired for that), got T={t}."
             )
+        if c != self.in_channels:
+            raise RuntimeError(
+                f"Expected C={self.in_channels} channels, got C={c}."
+            )
         frames = video.reshape(b * t, c, h, w)
         feats = self.backbone(frames)
         return feats.view(b, t, self.out_dim)
+
+    def forward_tokens(self, video: torch.Tensor) -> torch.Tensor:
+        """Return the pre-pool layer4 feature map as space-time tokens.
+
+        Shape: (B, T, H', W', out_dim) where H'=W'≈input/32 (ResNet stride).
+        Used by space-time temporal heads that want 2D structure preserved.
+        """
+        b, t, c, h, w = video.shape
+        if t != self.num_segments:
+            raise RuntimeError(
+                f"Expected T={self.num_segments} frames per clip (TSM is wired for that), got T={t}."
+            )
+        if c != self.in_channels:
+            raise RuntimeError(
+                f"Expected C={self.in_channels} channels, got C={c}."
+            )
+        frames = video.reshape(b * t, c, h, w)
+        bb = self.backbone
+        x = bb.conv1(frames)
+        x = bb.bn1(x)
+        x = bb.relu(x)
+        x = bb.maxpool(x)
+        x = bb.layer1(x)
+        x = bb.layer2(x)
+        x = bb.layer3(x)
+        x = bb.layer4(x)  # (B*T, out_dim, H', W')
+        _, c2, hp, wp = x.shape
+        return x.view(b, t, c2, hp, wp).permute(0, 1, 3, 4, 2).contiguous()

@@ -351,6 +351,199 @@ def build_strong_clip_transform(image_size: int = 224, use_imagenet_norm: bool =
     return ConsistentClipAug(image_size=image_size, use_imagenet_norm=use_imagenet_norm)
 
 
+def _farneback_clip(pil_frames_gray_uint8: List[np.ndarray]) -> torch.Tensor:
+    """Compute (T-1, 2, H, W) dense flow tensor between consecutive grayscale frames.
+
+    Inputs are uint8 numpy (H, W). Output is float32, raw (dx, dy) in pixels.
+    Caller is responsible for any scale normalization.
+    """
+    import cv2
+
+    flows: List[torch.Tensor] = []
+    for prev, nxt in zip(pil_frames_gray_uint8[:-1], pil_frames_gray_uint8[1:]):
+        flow = cv2.calcOpticalFlowFarneback(
+            prev, nxt, None,
+            pyr_scale=0.5, levels=3, winsize=15,
+            iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
+        )  # (H, W, 2) float32
+        flow_t = torch.from_numpy(flow).permute(2, 0, 1).contiguous()  # (2, H, W)
+        flows.append(flow_t)
+    return torch.stack(flows, dim=0)  # (T-1, 2, H, W)
+
+
+# Flow magnitudes from the smoke test sit at ~5 px mean / ~20 px p99 at 256x256.
+# Dividing by 20 puts the bulk in [-1, 1] which keeps the flow conv1 + BN happy.
+FLOW_NORM_DIVISOR: float = 20.0
+
+
+class FlowAwareClipAug:
+    """Two-stream training augmentation: returns (rgb_clip, flow_clip).
+
+    Pipeline:
+      1. RandomResizedCrop on PIL frames (consistent across the clip).
+      2. Farneback flow on grayscale of the post-RRC frames (pristine flow,
+         spatially aligned with the cropped RGB).
+      3. ColorJitter on RGB only (flow is geometric, not photometric).
+      4. ToTensor + Normalize on RGB.
+      5. Same RandomErasing rectangle applied to RGB and flow so both streams
+         see the same occlusion.
+
+    RandAugment is intentionally *not* used here — its geometric ops would
+    spatially mis-align RGB and flow, and reverting that on the flow tensor is
+    too fragile for V1.
+
+    Output:
+      rgb_clip:  (T, 3, H, W) float, ImageNet-normalized
+      flow_clip: (T-1, 2, H, W) float, divided by FLOW_NORM_DIVISOR
+    """
+
+    def __init__(
+        self,
+        image_size: int = 224,
+        scale: Tuple[float, float] = (0.5, 1.0),
+        ratio: Tuple[float, float] = (3 / 4, 4 / 3),
+        brightness: float = 0.4,
+        contrast: float = 0.4,
+        saturation: float = 0.4,
+        hue: float = 0.1,
+        erase_p: float = 0.25,
+        use_imagenet_norm: bool = True,
+        flow_norm_divisor: float = FLOW_NORM_DIVISOR,
+    ) -> None:
+        from torchvision.transforms import ColorJitter, RandomResizedCrop
+
+        self.image_size = image_size
+        self.scale = scale
+        self.ratio = ratio
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.hue = hue
+        self.erase_p = erase_p
+        self.flow_norm_divisor = flow_norm_divisor
+        self._RandomResizedCrop = RandomResizedCrop
+        self._ColorJitter = ColorJitter
+        if use_imagenet_norm:
+            self._mean = [0.485, 0.456, 0.406]
+            self._std = [0.229, 0.224, 0.225]
+        else:
+            self._mean = [0.5, 0.5, 0.5]
+            self._std = [0.5, 0.5, 0.5]
+
+    def __call__(self, frames):
+        import torchvision.transforms.functional as TF
+
+        # 1. RandomResizedCrop — same crop for all frames.
+        i, j, h, w = self._RandomResizedCrop.get_params(frames[0], scale=self.scale, ratio=self.ratio)
+        cropped = [TF.resized_crop(f, i, j, h, w, [self.image_size, self.image_size]) for f in frames]
+
+        # 2. Farneback flow on grayscale of the cropped frames.
+        gray_arrays = [np.array(f.convert("L"), dtype=np.uint8) for f in cropped]
+        flow_clip = _farneback_clip(gray_arrays)  # (T-1, 2, H, W)
+        flow_clip = flow_clip / self.flow_norm_divisor
+
+        # 3. ColorJitter on RGB only.
+        b_range = (max(0.0, 1 - self.brightness), 1 + self.brightness) if self.brightness > 0 else None
+        c_range = (max(0.0, 1 - self.contrast), 1 + self.contrast) if self.contrast > 0 else None
+        s_range = (max(0.0, 1 - self.saturation), 1 + self.saturation) if self.saturation > 0 else None
+        h_range = (-self.hue, self.hue) if self.hue > 0 else None
+        fn_idx, b, c, s, h_factor = self._ColorJitter.get_params(b_range, c_range, s_range, h_range)
+        jittered = []
+        for img in cropped:
+            for fid in fn_idx:
+                if fid == 0 and b is not None:
+                    img = TF.adjust_brightness(img, b)
+                elif fid == 1 and c is not None:
+                    img = TF.adjust_contrast(img, c)
+                elif fid == 2 and s is not None:
+                    img = TF.adjust_saturation(img, s)
+                elif fid == 3 and h_factor is not None:
+                    img = TF.adjust_hue(img, h_factor)
+            jittered.append(img)
+
+        # 4. ToTensor + Normalize on RGB.
+        rgb_tensors = [TF.normalize(TF.to_tensor(img), mean=self._mean, std=self._std) for img in jittered]
+        rgb_clip = torch.stack(rgb_tensors, dim=0)  # (T, 3, H, W)
+
+        # 5. Joint RandomErasing — same rectangle on RGB and flow.
+        if self.erase_p > 0 and random.random() < self.erase_p:
+            from torchvision.transforms import RandomErasing
+            erase_i, erase_j, erase_h, erase_w, erase_v = RandomErasing.get_params(
+                rgb_clip[0], scale=(0.02, 0.33), ratio=(0.3, 3.3), value=[0.0]
+            )
+            rgb_clip[:, :, erase_i : erase_i + erase_h, erase_j : erase_j + erase_w] = erase_v
+            flow_clip[:, :, erase_i : erase_i + erase_h, erase_j : erase_j + erase_w] = 0.0
+
+        return rgb_clip, flow_clip
+
+
+class FlowAwareEvalTransform:
+    """Two-stream eval/test transform: deterministic resize, no augmentation.
+
+    Output:
+      rgb_clip:  (T, 3, H, W) float, ImageNet-normalized
+      flow_clip: (T-1, 2, H, W) float, divided by FLOW_NORM_DIVISOR
+    """
+
+    def __init__(
+        self,
+        image_size: int = 224,
+        use_imagenet_norm: bool = True,
+        flow_norm_divisor: float = FLOW_NORM_DIVISOR,
+    ) -> None:
+        self.image_size = image_size
+        self.flow_norm_divisor = flow_norm_divisor
+        if use_imagenet_norm:
+            self._mean = [0.485, 0.456, 0.406]
+            self._std = [0.229, 0.224, 0.225]
+        else:
+            self._mean = [0.5, 0.5, 0.5]
+            self._std = [0.5, 0.5, 0.5]
+
+    def __call__(self, frames):
+        import torchvision.transforms.functional as TF
+
+        resized = [TF.resize(f, [self.image_size, self.image_size]) for f in frames]
+        gray_arrays = [np.array(f.convert("L"), dtype=np.uint8) for f in resized]
+        flow_clip = _farneback_clip(gray_arrays) / self.flow_norm_divisor
+
+        rgb_tensors = [TF.normalize(TF.to_tensor(img), mean=self._mean, std=self._std) for img in resized]
+        rgb_clip = torch.stack(rgb_tensors, dim=0)
+        return rgb_clip, flow_clip
+
+
+def build_flow_clip_transforms(
+    image_size: int = 256, is_training: bool = True, use_imagenet_norm: bool = True
+) -> Any:
+    """Two-stream clip transforms returning (rgb, flow) tuples."""
+    if is_training:
+        return FlowAwareClipAug(image_size=image_size, use_imagenet_norm=use_imagenet_norm)
+    return FlowAwareEvalTransform(image_size=image_size, use_imagenet_norm=use_imagenet_norm)
+
+
+class _FlowOnlyAdapter:
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __call__(self, frames):
+        _, flow_clip = self.inner(frames)
+        return flow_clip
+
+
+def build_flow_only_clip_transforms(
+    image_size: int = 256, is_training: bool = True, use_imagenet_norm: bool = True
+) -> Any:
+    """Flow-only clip transforms returning a single flow tensor (T-1, 2, H, W).
+
+    Wraps the two-stream transforms and discards the RGB output. Farneback still
+    runs on grayscale of the cropped frames; the RGB tensor is just dropped.
+    """
+    inner = build_flow_clip_transforms(
+        image_size=image_size, is_training=is_training, use_imagenet_norm=use_imagenet_norm
+    )
+    return _FlowOnlyAdapter(inner)
+
+
 def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float):
     """Sample one Mixup λ per batch; return mixed inputs and (y_a, y_b, λ) for loss.
 
@@ -393,6 +586,45 @@ def cutmix_batch(x: torch.Tensor, y: torch.Tensor, alpha: float):
     x_mixed[:, :, :, y1:y2, x1:x2] = x[perm][:, :, :, y1:y2, x1:x2]
     lam_adj = 1.0 - ((y2 - y1) * (x2 - x1)) / float(h * w)
     return x_mixed, (y, y[perm], lam_adj)
+
+
+def mixup_batch_two_stream(rgb: torch.Tensor, flow: torch.Tensor, y: torch.Tensor, alpha: float):
+    """Mixup on (rgb, flow) using the same lambda + permutation for both streams."""
+    if alpha <= 0:
+        return rgb, flow, (y, y, 1.0)
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(rgb.size(0), device=rgb.device)
+    rgb_mixed = lam * rgb + (1.0 - lam) * rgb[perm]
+    flow_mixed = lam * flow + (1.0 - lam) * flow[perm]
+    return rgb_mixed, flow_mixed, (y, y[perm], lam)
+
+
+def cutmix_batch_two_stream(rgb: torch.Tensor, flow: torch.Tensor, y: torch.Tensor, alpha: float):
+    """CutMix on (rgb, flow): same rectangle and same permutation pasted on both."""
+    if alpha <= 0:
+        return rgb, flow, (y, y, 1.0)
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(rgb.size(0), device=rgb.device)
+    h, w = rgb.shape[-2], rgb.shape[-1]
+    cut_ratio = math.sqrt(1.0 - lam)
+    cut_h = int(h * cut_ratio)
+    cut_w = int(w * cut_ratio)
+    if cut_h <= 0 or cut_w <= 0:
+        return rgb, flow, (y, y, 1.0)
+    cy = np.random.randint(h)
+    cx = np.random.randint(w)
+    y1 = max(0, cy - cut_h // 2)
+    y2 = min(h, cy + cut_h // 2)
+    x1 = max(0, cx - cut_w // 2)
+    x2 = min(w, cx + cut_w // 2)
+    if y2 == y1 or x2 == x1:
+        return rgb, flow, (y, y, 1.0)
+    rgb_mixed = rgb.clone()
+    rgb_mixed[:, :, :, y1:y2, x1:x2] = rgb[perm][:, :, :, y1:y2, x1:x2]
+    flow_mixed = flow.clone()
+    flow_mixed[:, :, :, y1:y2, x1:x2] = flow[perm][:, :, :, y1:y2, x1:x2]
+    lam_adj = 1.0 - ((y2 - y1) * (x2 - x1)) / float(h * w)
+    return rgb_mixed, flow_mixed, (y, y[perm], lam_adj)
 
 
 def build_two_group_param_groups(

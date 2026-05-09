@@ -1,0 +1,50 @@
+# @package _global_
+# Two-stream RGB + optical-flow.
+#   RGB:  TSM-ResNet50 + 2-layer Transformer (in_proj 512) + MLP classifier
+#         — same architecture as exp9 (tsm_resnet50_transformer_mlp).
+#   Flow: TSM-ResNet18 + 2-layer Transformer (in_proj 256) + MLP classifier
+#         — asymmetric smaller backbone, 2-channel raw (dx, dy) input.
+# Fusion: single learnable scalar gate (sigmoid; init 0.5/0.5).
+# Modality dropout: 0.1 each direction during training.
+model:
+  name: two_stream
+  num_classes: ${num_classes}
+  modality_dropout: 0.1
+  rgb:
+    spatial:
+      name: resnet_tsm
+      variant: resnet50
+      num_segments: ${dataset.num_frames}
+      fold_div: 8
+      pretrained: false
+      in_channels: 3
+    temporal:
+      name: transformer
+      in_proj_dim: 512
+      num_heads: 8
+      num_layers: 2
+      dim_feedforward: 2048
+      dropout: 0.15
+    classifier:
+      name: mlp
+      hidden_dim: 512
+      dropout: 0.3
+  flow:
+    spatial:
+      name: resnet_tsm
+      variant: resnet18
+      num_segments: 3            # T - 1 = 4 - 1 (flow pairs)
+      fold_div: 8
+      pretrained: false
+      in_channels: 2
+    temporal:
+      name: transformer
+      in_proj_dim: 256
+      num_heads: 8
+      num_layers: 2
+      dim_feedforward: 1024
+      dropout: 0.15
+    classifier:
+      name: mlp
+      hidden_dim: 256
+      dropout: 0.3

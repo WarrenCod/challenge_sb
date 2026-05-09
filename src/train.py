@@ -33,19 +33,24 @@ from models.cmt import CMT
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.modular import attach_aux_head, build_modular_model
+from models.two_stream import build_two_stream_model
 from utils import (
     ModelEMA,
     atomic_torch_save,
+    build_flow_clip_transforms,
+    build_flow_only_clip_transforms,
     build_llrd_param_groups,
     build_strong_clip_transform,
     build_transforms,
     build_two_group_param_groups,
     capture_rng_state,
     cutmix_batch,
+    cutmix_batch_two_stream,
     finish_wandb,
     init_wandb,
     make_resume_hash,
     mixup_batch,
+    mixup_batch_two_stream,
     restore_rng_state,
     set_seed,
     split_train_val,
@@ -83,6 +88,8 @@ def build_model(cfg: DictConfig) -> nn.Module:
             head_hidden=int(cfg.model.head_hidden),
             dropout=float(cfg.model.dropout),
         )
+    if name == "two_stream":
+        return build_two_stream_model(cfg.model, num_classes=num_classes)
 
     raise ValueError(f"Unknown model.name: {name}")
 
@@ -239,6 +246,160 @@ def evaluate_epoch(
     return average_loss, accuracy
 
 
+def train_one_epoch_two_stream(
+    model: nn.Module,
+    data_loader: DataLoader,
+    loss_fn: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    scaler: Optional[GradScaler] = None,
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    grad_clip: float = 0.0,
+    epoch_label: str = "",
+    mixup_alpha: float = 0.0,
+    cutmix_alpha: float = 0.0,
+    ema: Optional[ModelEMA] = None,
+    aux_loss_weight: float = 0.0,
+) -> Tuple[float, float]:
+    """Two-stream variant: data loader yields ((rgb, flow), labels)."""
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    use_aux = aux_loss_weight > 0.0 and getattr(model, "aux_head", None) is not None
+
+    def _aux_ce(aux_logits: torch.Tensor, y_a: torch.Tensor, y_b: torch.Tensor, lam: float) -> torch.Tensor:
+        B, T, K = aux_logits.shape
+        flat = aux_logits.reshape(B * T, K)
+        ya_rep = y_a.repeat_interleave(T)
+        yb_rep = y_b.repeat_interleave(T)
+        return lam * loss_fn(flat, ya_rep) + (1.0 - lam) * loss_fn(flat, yb_rep)
+
+    def _forward_loss(rgb, flow, y_a, y_b, lam):
+        if use_aux:
+            logits, (aux_rgb, aux_flow) = model.forward_with_aux(rgb, flow)
+            main = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+            aux = _aux_ce(aux_rgb, y_a, y_b, lam) + _aux_ce(aux_flow, y_a, y_b, lam)
+            return logits, main + aux_loss_weight * aux
+        logits = model(rgb, flow)
+        loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+        return logits, loss
+
+    bar = tqdm(data_loader, desc=f"{epoch_label} train", leave=False, dynamic_ncols=True)
+    for (rgb_batch, flow_batch), labels in bar:
+        rgb_batch = rgb_batch.to(device, non_blocking=True)
+        flow_batch = flow_batch.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        if mixup_alpha > 0 and cutmix_alpha > 0:
+            if random.random() < 0.5:
+                rgb_batch, flow_batch, (y_a, y_b, lam) = mixup_batch_two_stream(
+                    rgb_batch, flow_batch, labels, mixup_alpha
+                )
+            else:
+                rgb_batch, flow_batch, (y_a, y_b, lam) = cutmix_batch_two_stream(
+                    rgb_batch, flow_batch, labels, cutmix_alpha
+                )
+        elif mixup_alpha > 0:
+            rgb_batch, flow_batch, (y_a, y_b, lam) = mixup_batch_two_stream(
+                rgb_batch, flow_batch, labels, mixup_alpha
+            )
+        elif cutmix_alpha > 0:
+            rgb_batch, flow_batch, (y_a, y_b, lam) = cutmix_batch_two_stream(
+                rgb_batch, flow_batch, labels, cutmix_alpha
+            )
+        else:
+            y_a, y_b, lam = labels, labels, 1.0
+
+        optimizer.zero_grad(set_to_none=True)
+
+        stepped = True
+        if amp and scaler is not None:
+            with autocast(device_type=device.type, dtype=amp_dtype):
+                logits, loss = _forward_loss(rgb_batch, flow_batch, y_a, y_b, lam)
+            scaler.scale(loss).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            prev_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            stepped = scaler.get_scale() >= prev_scale
+        elif amp:
+            with autocast(device_type=device.type, dtype=amp_dtype):
+                logits, loss = _forward_loss(rgb_batch, flow_batch, y_a, y_b, lam)
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+        else:
+            logits, loss = _forward_loss(rgb_batch, flow_batch, y_a, y_b, lam)
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+        if scheduler is not None and stepped:
+            scheduler.step()
+        if ema is not None and stepped:
+            ema.update(model)
+
+        running_loss += float(loss.item()) * labels.size(0)
+        predictions = logits.argmax(dim=1)
+        correct += int((predictions == y_a).sum().item())
+        total += labels.size(0)
+        bar.set_postfix(
+            loss=running_loss / total,
+            acc=correct / total,
+            lr=optimizer.param_groups[0]["lr"],
+            gate=float(torch.sigmoid(model.gate if hasattr(model, "gate") else getattr(model, "module", model).gate).item()),
+        )
+
+    return running_loss / max(total, 1), correct / max(total, 1)
+
+
+@torch.no_grad()
+def evaluate_epoch_two_stream(
+    model: nn.Module,
+    data_loader: DataLoader,
+    loss_fn: nn.Module,
+    device: torch.device,
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    epoch_label: str = "",
+) -> Tuple[float, float]:
+    """Two-stream eval: data loader yields ((rgb, flow), labels)."""
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    bar = tqdm(data_loader, desc=f"{epoch_label} val", leave=False, dynamic_ncols=True)
+    for (rgb_batch, flow_batch), labels in bar:
+        rgb_batch = rgb_batch.to(device, non_blocking=True)
+        flow_batch = flow_batch.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        if amp:
+            with autocast(device_type=device.type, dtype=amp_dtype):
+                logits = model(rgb_batch, flow_batch)
+                loss = loss_fn(logits, labels)
+        else:
+            logits = model(rgb_batch, flow_batch)
+            loss = loss_fn(logits, labels)
+
+        running_loss += float(loss.item()) * labels.size(0)
+        predictions = logits.argmax(dim=1)
+        correct += int((predictions == labels).sum().item())
+        total += labels.size(0)
+        bar.set_postfix(loss=running_loss / total, acc=correct / total)
+
+    return running_loss / max(total, 1), correct / max(total, 1)
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
@@ -272,25 +433,25 @@ def main(cfg: DictConfig) -> None:
     )
 
     # Match normalization to pretrained flag (ImageNet stats when using pretrained weights).
+    is_two_stream = cfg.model.name == "two_stream"
+    modality = str(cfg.dataset.get("modality", "rgb")).lower()
+    is_flow_only = modality == "flow" and not is_two_stream
     if cfg.model.name == "modular":
         use_imagenet_norm = bool(cfg.model.spatial.get("pretrained", False))
+    elif is_two_stream:
+        use_imagenet_norm = bool(cfg.model.rgb.spatial.get("pretrained", False))
     else:
         use_imagenet_norm = bool(cfg.model.get("pretrained", False))
     image_size = int(cfg.dataset.get("image_size", 224))
-    train_transform = build_transforms(
-        image_size=image_size, is_training=True, use_imagenet_norm=use_imagenet_norm
-    )
-    eval_transform = build_transforms(
-        image_size=image_size, is_training=False, use_imagenet_norm=use_imagenet_norm
-    )
 
-    # Strong clip-aware augmentation (RandomResizedCrop + ColorJitter + RandAugment +
-    # RandomErasing, all consistent across frames). Used when training a temporal model
-    # like TSM where per-frame independent crops would scramble the motion signal.
-    use_strong_aug = bool(cfg.training.get("strong_clip_aug", False))
-    if use_strong_aug:
-        train_clip_transform = build_strong_clip_transform(
-            image_size=image_size, use_imagenet_norm=use_imagenet_norm
+    if is_flow_only:
+        # Flow-only single-stream: data loader yields (flow_tensor, label).
+        # Reuses FlowAwareClipAug/EvalTransform and discards the RGB output.
+        train_clip_transform = build_flow_only_clip_transforms(
+            image_size=image_size, is_training=True, use_imagenet_norm=use_imagenet_norm
+        )
+        eval_clip_transform = build_flow_only_clip_transforms(
+            image_size=image_size, is_training=False, use_imagenet_norm=use_imagenet_norm
         )
         train_dataset = VideoFrameDataset(
             root_dir=train_dir,
@@ -298,19 +459,68 @@ def main(cfg: DictConfig) -> None:
             clip_transform=train_clip_transform,
             sample_list=train_samples,
         )
-    else:
+        val_dataset = VideoFrameDataset(
+            root_dir=train_dir,
+            num_frames=int(cfg.dataset.num_frames),
+            clip_transform=eval_clip_transform,
+            sample_list=val_samples,
+        )
+    elif is_two_stream:
+        # Two-stream: data loader yields ((rgb, flow), label). Train uses
+        # FlowAwareClipAug (RRC + ColorJitter + RandomErasing + Farneback);
+        # val uses deterministic resize + flow.
+        train_clip_transform = build_flow_clip_transforms(
+            image_size=image_size, is_training=True, use_imagenet_norm=use_imagenet_norm
+        )
+        eval_clip_transform = build_flow_clip_transforms(
+            image_size=image_size, is_training=False, use_imagenet_norm=use_imagenet_norm
+        )
         train_dataset = VideoFrameDataset(
             root_dir=train_dir,
             num_frames=int(cfg.dataset.num_frames),
-            transform=train_transform,
+            clip_transform=train_clip_transform,
             sample_list=train_samples,
         )
-    val_dataset = VideoFrameDataset(
-        root_dir=train_dir,
-        num_frames=int(cfg.dataset.num_frames),
-        transform=eval_transform,
-        sample_list=val_samples,
-    )
+        val_dataset = VideoFrameDataset(
+            root_dir=train_dir,
+            num_frames=int(cfg.dataset.num_frames),
+            clip_transform=eval_clip_transform,
+            sample_list=val_samples,
+        )
+    else:
+        train_transform = build_transforms(
+            image_size=image_size, is_training=True, use_imagenet_norm=use_imagenet_norm
+        )
+        eval_transform = build_transforms(
+            image_size=image_size, is_training=False, use_imagenet_norm=use_imagenet_norm
+        )
+        # Strong clip-aware augmentation (RandomResizedCrop + ColorJitter + RandAugment +
+        # RandomErasing, all consistent across frames). Used when training a temporal model
+        # like TSM where per-frame independent crops would scramble the motion signal.
+        use_strong_aug = bool(cfg.training.get("strong_clip_aug", False))
+        if use_strong_aug:
+            train_clip_transform = build_strong_clip_transform(
+                image_size=image_size, use_imagenet_norm=use_imagenet_norm
+            )
+            train_dataset = VideoFrameDataset(
+                root_dir=train_dir,
+                num_frames=int(cfg.dataset.num_frames),
+                clip_transform=train_clip_transform,
+                sample_list=train_samples,
+            )
+        else:
+            train_dataset = VideoFrameDataset(
+                root_dir=train_dir,
+                num_frames=int(cfg.dataset.num_frames),
+                transform=train_transform,
+                sample_list=train_samples,
+            )
+        val_dataset = VideoFrameDataset(
+            root_dir=train_dir,
+            num_frames=int(cfg.dataset.num_frames),
+            transform=eval_transform,
+            sample_list=val_samples,
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -336,12 +546,39 @@ def main(cfg: DictConfig) -> None:
     aux_cfg = cfg.training.get("aux_loss", None)
     aux_loss_weight = 0.0
     if aux_cfg is not None and bool(aux_cfg.get("enabled", False)):
-        if cfg.model.name != "modular":
-            raise ValueError("training.aux_loss only supported for model.name=modular")
-        attach_aux_head(model, num_classes=int(cfg.model.num_classes))
-        model.aux_head = model.aux_head.to(device)
+        if cfg.model.name == "modular":
+            attach_aux_head(model, num_classes=int(cfg.model.num_classes))
+            model.aux_head = model.aux_head.to(device)
+        elif is_two_stream:
+            # Mirror exp9: per-frame deep-supervision on each substream.
+            attach_aux_head(model.rgb_model, num_classes=int(cfg.model.num_classes))
+            attach_aux_head(model.flow_model, num_classes=int(cfg.model.num_classes))
+            model.rgb_model.aux_head = model.rgb_model.aux_head.to(device)
+            model.flow_model.aux_head = model.flow_model.aux_head.to(device)
+        else:
+            raise ValueError("training.aux_loss only supported for model.name in {modular, two_stream}")
         aux_loss_weight = float(aux_cfg.get("weight", 0.3))
         print(f"[train] aux per-frame loss enabled (weight={aux_loss_weight})")
+
+    # Optional RGB-stream hot-start from a single-stream checkpoint (e.g. exp9).
+    # Only fires for two_stream and only on a fresh run (no resume file).
+    last_path_probe = Path(cfg.training.checkpoint_path).resolve()
+    last_path_probe = last_path_probe.with_name(last_path_probe.stem + "_last" + last_path_probe.suffix)
+    rgb_init_path = cfg.training.get("rgb_init_from_checkpoint", None)
+    resume_will_happen = bool(cfg.training.get("resume", True)) and last_path_probe.exists()
+    if is_two_stream and rgb_init_path and not resume_will_happen:
+        rgb_init_path = Path(str(rgb_init_path)).resolve()
+        print(f"[train] hot-starting RGB stream from {rgb_init_path}")
+        ckpt = torch.load(rgb_init_path, map_location=device, weights_only=False)
+        sd = ckpt["model_state_dict"]
+        # Drop training-only keys (aux head etc) before loading.
+        missing, unexpected = model.rgb_model.load_state_dict(sd, strict=False)
+        # Aux-head weights from the source ckpt would land under "aux_head.*"; ok if missing.
+        meaningful_missing = [k for k in missing if not k.startswith("aux_head")]
+        if meaningful_missing:
+            print(f"[train] RGB hot-start missing keys: {meaningful_missing[:5]}{'...' if len(meaningful_missing) > 5 else ''}")
+        if unexpected:
+            print(f"[train] RGB hot-start unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
 
     amp_enabled = bool(cfg.training.get("amp", False)) and device.type == "cuda"
     amp_dtype_str = str(cfg.training.get("amp_dtype", "fp16")).lower()
@@ -376,16 +613,20 @@ def main(cfg: DictConfig) -> None:
         optimizer = torch.optim.AdamW(groups)
         print(f"[train] AdamW + LLRD (decay={llrd}): {len(groups)} param groups")
     elif backbone_lr is not None:
+        # Two-stream uses the RGB backbone as the hot-started slow group; flow
+        # stream (fresh) and heads/gate train at head_lr.
+        backbone_prefix = "rgb_model.spatial." if is_two_stream else "spatial."
         groups = build_two_group_param_groups(
             model,
             head_lr=float(cfg.training.lr),
             backbone_lr=float(backbone_lr),
             weight_decay=weight_decay,
+            backbone_prefix=backbone_prefix,
         )
         optimizer = torch.optim.AdamW(groups)
         print(
             f"[train] AdamW + 2-group LR: backbone={backbone_lr}, head={cfg.training.lr}, "
-            f"{len(groups)} param groups"
+            f"backbone_prefix='{backbone_prefix}', {len(groups)} param groups"
         )
     else:
         optimizer = torch.optim.AdamW(
@@ -462,9 +703,12 @@ def main(cfg: DictConfig) -> None:
     mixup_alpha = float(cfg.training.get("mixup_alpha", 0.0))
     cutmix_alpha = float(cfg.training.get("cutmix_alpha", 0.0))
 
+    train_fn = train_one_epoch_two_stream if is_two_stream else train_one_epoch
+    eval_fn = evaluate_epoch_two_stream if is_two_stream else evaluate_epoch
+
     for epoch in range(start_epoch, int(cfg.training.epochs)):
         label = f"[{epoch + 1}/{cfg.training.epochs}]"
-        train_loss, train_acc = train_one_epoch(
+        train_loss, train_acc = train_fn(
             model,
             train_loader,
             loss_fn,
@@ -482,7 +726,7 @@ def main(cfg: DictConfig) -> None:
             aux_loss_weight=aux_loss_weight,
         )
         eval_model = ema.module if ema is not None else model
-        val_loss, val_acc = evaluate_epoch(
+        val_loss, val_acc = eval_fn(
             eval_model,
             val_loader,
             loss_fn,
@@ -497,17 +741,17 @@ def main(cfg: DictConfig) -> None:
             f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
             f"val loss {val_loss:.4f} acc {val_acc:.4f}"
         )
-        wandb_log(
-            {
-                "train/loss": train_loss,
-                "train/acc": train_acc,
-                "val/loss": val_loss,
-                "val/acc": val_acc,
-                "lr": optimizer.param_groups[0]["lr"],
-                "epoch": epoch + 1,
-            },
-            step=epoch + 1,
-        )
+        log_metrics = {
+            "train/loss": train_loss,
+            "train/acc": train_acc,
+            "val/loss": val_loss,
+            "val/acc": val_acc,
+            "lr": optimizer.param_groups[0]["lr"],
+            "epoch": epoch + 1,
+        }
+        if is_two_stream:
+            log_metrics["gate/rgb_weight"] = float(torch.sigmoid(model.gate).item())
+        wandb_log(log_metrics, step=epoch + 1)
 
         if val_acc > best_val_accuracy:
             best_val_accuracy = val_acc

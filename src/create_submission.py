@@ -28,7 +28,12 @@ from torch.utils.data import DataLoader
 
 from dataset.video_dataset import VideoFrameDataset
 from train import build_model
-from utils import build_transforms, set_seed
+from utils import (
+    build_flow_clip_transforms,
+    build_flow_only_clip_transforms,
+    build_transforms,
+    set_seed,
+)
 
 
 def load_manifest_video_names(manifest_path: Path) -> List[str]:
@@ -118,6 +123,22 @@ def build_model_from_checkpoint(ckpt: Dict[str, Any]) -> torch.nn.Module:
     return build_model(cfg)
 
 
+def _forward(model: torch.nn.Module, batch_inputs, device: torch.device) -> torch.Tensor:
+    """Single forward; handles both single-tensor and (rgb, flow) tuple inputs."""
+    if isinstance(batch_inputs, (list, tuple)):
+        rgb, flow = batch_inputs
+        rgb = rgb.to(device)
+        flow = flow.to(device)
+        return model(rgb, flow)
+    return model(batch_inputs.to(device))
+
+
+def _batch_size(batch_inputs) -> int:
+    if isinstance(batch_inputs, (list, tuple)):
+        return batch_inputs[0].size(0)
+    return batch_inputs.size(0)
+
+
 @torch.no_grad()
 def run_inference(
     model: torch.nn.Module,
@@ -132,12 +153,11 @@ def run_inference(
     # About 10 progress lines for long runs; at least every batch if tiny
     log_interval = max(1, n_batches // 10)
     processed = 0
-    for batch_idx, (video_batch, _labels) in enumerate(loader, start=1):
-        video_batch = video_batch.to(device)
-        logits = model(video_batch)
+    for batch_idx, (batch_inputs, _labels) in enumerate(loader, start=1):
+        logits = _forward(model, batch_inputs, device)
         batch_pred = logits.argmax(dim=1).cpu().tolist()
         preds.extend(int(p) for p in batch_pred)
-        bs = video_batch.size(0)
+        bs = _batch_size(batch_inputs)
         processed += bs
         if batch_idx % log_interval == 0 or batch_idx == n_batches:
             print(
@@ -167,9 +187,8 @@ def accumulate_softmax(
     cursor = 0
     n_batches = len(loader)
     log_interval = max(1, n_batches // 5)
-    for batch_idx, (video_batch, _labels) in enumerate(loader, start=1):
-        video_batch = video_batch.to(device)
-        logits = model(video_batch)
+    for batch_idx, (batch_inputs, _labels) in enumerate(loader, start=1):
+        logits = _forward(model, batch_inputs, device)
         probs = logits.softmax(dim=1).cpu()
         bs = probs.size(0)
         out[cursor : cursor + bs] = probs
@@ -201,7 +220,11 @@ def main(cfg: DictConfig) -> None:
     print(f"Loading checkpoint: {checkpoint_path}", flush=True)
     ckpt: Dict[str, Any] = torch.load(checkpoint_path, map_location="cpu")
     model = build_model_from_checkpoint(ckpt)
-    model.load_state_dict(ckpt["model_state_dict"])
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if missing:
+        raise RuntimeError(f"Checkpoint missing required keys: {missing}")
+    if unexpected:
+        print(f"[load] dropping training-only keys: {unexpected}", flush=True)
     model.to(device)
     print(f"Model on device: {device}", flush=True)
 
@@ -210,9 +233,27 @@ def main(cfg: DictConfig) -> None:
     saved_cfg = ckpt.get("config") or {}
     saved_dataset = saved_cfg.get("dataset", {}) if isinstance(saved_cfg, dict) else {}
     image_size = int(saved_dataset.get("image_size", cfg.dataset.get("image_size", 224)))
-    eval_transform = build_transforms(
-        image_size=image_size, is_training=False, use_imagenet_norm=pretrained
-    )
+    saved_model_name = (saved_cfg.get("model", {}) or {}).get("name") if isinstance(saved_cfg, dict) else None
+    is_two_stream = saved_model_name == "two_stream"
+    modality = str(saved_dataset.get("modality", "rgb")).lower() if isinstance(saved_dataset, dict) else "rgb"
+    is_flow_only = modality == "flow" and not is_two_stream
+    if is_two_stream:
+        eval_transform = None  # signal: use clip_transform path below
+        eval_clip_transform = build_flow_clip_transforms(
+            image_size=image_size, is_training=False, use_imagenet_norm=pretrained
+        )
+        print("[load] two-stream model: using flow-aware eval transform.", flush=True)
+    elif is_flow_only:
+        eval_transform = None
+        eval_clip_transform = build_flow_only_clip_transforms(
+            image_size=image_size, is_training=False, use_imagenet_norm=pretrained
+        )
+        print("[load] flow-only model: using flow eval clip transform.", flush=True)
+    else:
+        eval_clip_transform = None
+        eval_transform = build_transforms(
+            image_size=image_size, is_training=False, use_imagenet_norm=pretrained
+        )
 
     test_root = Path(cfg.dataset.test_dir).resolve()
     output_path = Path(cfg.dataset.submission_output).resolve()
@@ -249,6 +290,7 @@ def main(cfg: DictConfig) -> None:
             root_dir=test_root,
             num_frames=num_frames,
             transform=eval_transform,
+            clip_transform=eval_clip_transform,
             sample_list=sample_list,
         )
         loader = DataLoader(
@@ -281,6 +323,7 @@ def main(cfg: DictConfig) -> None:
                 root_dir=test_root,
                 num_frames=num_frames,
                 transform=eval_transform,
+                clip_transform=eval_clip_transform,
                 sample_list=sample_list,
                 frame_offset_fraction=off,
             )

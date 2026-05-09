@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from train import build_model
-from utils import build_transforms, set_seed
+from utils import build_flow_only_clip_transforms, build_transforms, set_seed
 
 
 def load_model_from_checkpoint(checkpoint: Dict[str, Any], device: torch.device) -> torch.nn.Module:
@@ -37,7 +37,19 @@ def load_model_from_checkpoint(checkpoint: Dict[str, Any], device: torch.device)
         )
     cfg = OmegaConf.create(checkpoint["config"])
     model = build_model(cfg)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # Aux deep-supervision head is train-only; checkpoints saved with
+    # training.aux_loss.enabled=true carry "aux_head.*" keys. They have no
+    # effect on the main forward path, so drop them with strict=False.
+    missing, unexpected = model.load_state_dict(
+        checkpoint["model_state_dict"], strict=False
+    )
+    meaningful_missing = [k for k in missing if not k.startswith("aux_head")]
+    meaningful_unexpected = [k for k in unexpected if not k.startswith("aux_head")]
+    if meaningful_missing or meaningful_unexpected:
+        raise RuntimeError(
+            f"Checkpoint mismatch — missing: {meaningful_missing[:5]}, "
+            f"unexpected: {meaningful_unexpected[:5]}"
+        )
     model.to(device)
     model.eval()
     return model
@@ -64,10 +76,22 @@ def main(cfg: DictConfig) -> None:
     # Image size must also match the trained config (256 vs 224 changes feature scale).
     saved_cfg = raw.get("config") or {}
     saved_dataset = saved_cfg.get("dataset", {}) if isinstance(saved_cfg, dict) else {}
+    saved_model = saved_cfg.get("model", {}) if isinstance(saved_cfg, dict) else {}
     image_size = int(saved_dataset.get("image_size", cfg.dataset.get("image_size", 224)))
-    eval_transform = build_transforms(
-        image_size=image_size, is_training=False, use_imagenet_norm=pretrained_used
-    )
+    modality = str(saved_dataset.get("modality", "rgb")).lower()
+    is_flow_only = modality == "flow" and saved_model.get("name") != "two_stream"
+
+    if is_flow_only:
+        eval_transform = None
+        eval_clip_transform = build_flow_only_clip_transforms(
+            image_size=image_size, is_training=False, use_imagenet_norm=pretrained_used
+        )
+        print("[load] flow-only model: using flow eval clip transform.")
+    else:
+        eval_clip_transform = None
+        eval_transform = build_transforms(
+            image_size=image_size, is_training=False, use_imagenet_norm=pretrained_used
+        )
 
     val_dir = Path(cfg.dataset.val_dir).resolve()
     val_samples = collect_video_samples(val_dir)
@@ -82,6 +106,7 @@ def main(cfg: DictConfig) -> None:
         root_dir=val_dir,
         num_frames=num_frames,
         transform=eval_transform,
+        clip_transform=eval_clip_transform,
         sample_list=val_samples,
     )
 
