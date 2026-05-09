@@ -37,19 +37,20 @@ Run from the repo root (Hydra resolves `configs/` via `config_path="configs"` in
 # Smoke test FIRST — always — before any long run (short, stays in foreground)
 python src/train.py experiment=baseline_from_scratch dataset.max_samples=64 training.epochs=1 training.batch_size=4
 
-# Full training — ALWAYS run inside tmux so an SSH drop can't kill the job.
-#   Detach from a live session:  Ctrl-b  then  d
-#   Reattach later:               tmux attach -t train
-#   List sessions:                tmux ls
-#   Kill a stuck session:         tmux kill-session -t train
-# `tee` mirrors tqdm/prints to train.log so you can inspect progress even without reattaching.
-tmux new -s train "python src/train.py experiment=baseline_from_scratch 2>&1 | tee train.log"
-tmux new -s train "python src/train.py experiment=baseline_pretrained   2>&1 | tee train.log"
-tmux new -s train "python src/train.py experiment=cnn_lstm              training.epochs=10 training.batch_size=16 2>&1 | tee train.log"
+# Full training — launch via scripts/launch.sh, which wraps the run in
+# scripts/train_robust.sh (auto-restart on crash, resumes from <ckpt>_last.pt)
+# and daemonizes via `nohup setsid` so it survives SSH drop AND tmux-server
+# death (a bare-tmux launch killed the v4 resume on 2026-05-08).
+bash scripts/launch.sh baseline_pretrained          # train.py
+bash scripts/launch.sh exp3_ibot_transformer ibot   # pretrain_ibot.py
+# Follow output:  tail -f logs/<experiment>.log
+# Watchdog PID:   cat logs/<experiment>.pid
+# Halt cleanly:   touch /Data/challenge_sb/STOP   # blocks the next retry
+# Halt now:       touch /Data/challenge_sb/STOP && pkill -f 'src/train.py.*experiment=<name>'
 
-# If tmux isn't available, the nohup fallback is:
-#   nohup python src/train.py experiment=... > train.log 2>&1 &  disown
-#   tail -f train.log   # to watch; Ctrl-c only stops tail, not the training
+# Direct (one-off, no launch script): same daemon pattern, by hand —
+#   nohup setsid bash scripts/train_robust.sh python src/train.py experiment=foo \
+#       >> logs/foo.log 2>&1 < /dev/null & disown
 
 # Evaluate (short, keep in foreground)
 python src/evaluate.py training.checkpoint_path=best_model.pt

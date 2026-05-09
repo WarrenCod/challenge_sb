@@ -7,18 +7,20 @@
 # Example (Phase A on Machine A):
 #   bash scripts/chain.sh mae_pretrain exp1_mae_meanpool
 #
-# Run inside its own tmux so the chain survives SSH drops:
-#   tmux new -d -s chain_mae_to_exp1 'bash scripts/chain.sh mae_pretrain exp1_mae_meanpool'
+# Run as a daemon so the chain survives SSH drops and tmux-server death:
+#   nohup setsid bash scripts/chain.sh mae_pretrain exp1_mae_meanpool \
+#       >> logs/chain_mae_to_exp1.log 2>&1 < /dev/null & disown
 #
 # Behavior:
-#   - Polls every 30 s for tmux session to disappear.
-#   - On disappearance, checks logs/<wait_session>.log for completion marker
+#   - Polls every 30 s for the wait_session's watchdog daemon to exit
+#     (PID from logs/<wait>.pid; falls back to tmux for legacy sessions).
+#   - On exit, checks logs/<wait_session>.log for completion marker
 #     ("Done." from the python script OR train_robust's "training complete").
 #   - If completion confirmed AND no STOP file exists, runs scripts/launch.sh <next>.
 #   - Otherwise exits 1 with a message (you'll have to re-launch by hand).
 #
-# launch.sh refuses to launch into an already-existing tmux session, so even
-# if this script fires twice it can't double-spawn.
+# launch.sh refuses to launch if the watchdog PID file shows a live process,
+# so even if this script fires twice it can't double-spawn.
 
 set -u
 WAIT="${1:-}"
@@ -31,13 +33,24 @@ fi
 
 cd "$(dirname "$0")/.."
 LOG="logs/${WAIT}.log"
+PID_FILE="logs/${WAIT}.pid"
 STOP_FILE="${STOP_FILE:-/Data/challenge_sb/STOP}"
 
-echo "[chain] $(date -Iseconds) waiting for tmux session '$WAIT' to end..."
-while tmux has-session -t "$WAIT" 2>/dev/null; do
+is_running() {
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        return 0
+    fi
+    if tmux has-session -t "$WAIT" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+echo "[chain] $(date -Iseconds) waiting for '$WAIT' watchdog to exit..."
+while is_running; do
     sleep 30
 done
-echo "[chain] $(date -Iseconds) session '$WAIT' ended."
+echo "[chain] $(date -Iseconds) '$WAIT' watchdog has exited."
 
 if [ -e "$STOP_FILE" ]; then
     echo "[chain] STOP file present at $STOP_FILE; not launching '$NEXT'." >&2
