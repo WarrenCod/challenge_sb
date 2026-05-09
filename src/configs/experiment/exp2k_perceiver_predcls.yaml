@@ -1,0 +1,69 @@
+# @package _global_
+# exp2k (Track 1): exp2h recipe + (A) full per-frame patch tokens via Perceiver
+# head + (D) predict-next-CLS auxiliary loss.
+#
+# Architecture-axis change only — recipe identical to exp2h: same teacher
+# (exp2c, single, α=0.5, T=4), same EMA, same LLRD, same mixup/cutmix, same
+# drop_path/dropout, same 100-epoch schedule, same seed.
+#
+# Two coupled changes:
+#   1. Spatial backbone now exposes the full (1 CLS + 196 patch) tokens per
+#      frame; temporal head is a Perceiver with 16 learnable queries that
+#      cross-attend to T*(N+1) ≈ 788 KV tokens, then 3 self-attn layers, mean
+#      pool. This raises the head's input bandwidth from 8 tokens (exp2h) to
+#      788 tokens — 100× more spatial-temporal information.
+#   2. Auxiliary "predict-next-CLS" head: from frames 1..3 spatial CLS, predict
+#      frame-4 CLS with a 2-layer MLP, cosine loss vs stopgrad(CLS_4). λ=0.1.
+#      Task-matched inductive bias for "What Happens Next?".
+defaults:
+  - override /model: vit_mae_perceiver
+
+model:
+  spatial:
+    drop_path: 0.2
+  temporal:
+    dropout: 0.2
+
+dataset:
+  num_frames: 4
+  seed: 1337
+  random_temporal_offset: true
+
+training:
+  batch_size: 16
+  # Stability fixes after first run diverged at epoch 10:
+  #   lr 3e-4 -> 1.5e-4, warmup 8 -> 12, grad_clip 1.0 -> 0.5.
+  # Code-side fixes: cross-attn + predict-next-CLS run in fp32; train.py
+  # aborts non-zero on NaN train loss without overwriting _last.pt.
+  lr: 1.5e-4
+  llrd: 0.75
+  epochs: 100
+  warmup_epochs: 12
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 0.5
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp2k_perceiver_predcls.pt
+  device: cuda
+  distill:
+    teacher_ckpt: ${hydra:runtime.cwd}/checkpoints/exp2c_mae_transformer.pt
+    alpha: 0.5
+    temperature: 4.0
+  predict_next_cls:
+    enabled: true
+    weight: 0.1
+    hidden_dim: 512
+
+submission:
+  tta_clips: 3
+
+wandb:
+  enabled: true
+  run_name: exp2k_perceiver_predcls
+  tags: [track1, stage2, mae, perceiver, predict_next_cls, distill, ema, cutmix, real_val]

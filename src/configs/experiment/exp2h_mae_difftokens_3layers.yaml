@@ -1,0 +1,63 @@
+# @package _global_
+# exp2h (Track 1): exp2f recipe + (A) difference tokens in the temporal head
+# + 3-layer temporal transformer (vs 2). Architecture-axis change only.
+#
+# Why two changes, not one:
+#   - Adding 3 delta tokens raises the temporal head's effective sequence
+#     length from 5 to 8. The 2-layer head was sized for 5; depth at 5 tokens
+#     is already saturated. With 8 tokens a 3rd layer has new relational
+#     pairs to compute, so it isn't dead capacity. Coupling the changes
+#     keeps the depth/token-count ratio meaningful.
+#
+# Everything else identical to exp2f: same seed (1337), same teacher
+# (exp2c, single, α=0.5, T=4), same EMA, same LLRD, same mixup/cutmix,
+# same drop_path/dropout, same 100-epoch schedule.
+#
+# Note: as of this experiment train.py validates on the REAL val_dir
+# (processed_data/val, 6,746 videos), not a 20% slice of train_dir. The
+# val/best numbers will not be on the same scale as exp2c..2g; expect a
+# shift of unknown sign and magnitude.
+defaults:
+  - override /model: vit_mae_relational_transformer
+
+model:
+  spatial:
+    drop_path: 0.2
+  temporal:
+    dropout: 0.2
+
+dataset:
+  num_frames: 4
+  seed: 1337
+  random_temporal_offset: true
+
+training:
+  batch_size: 16
+  lr: 3.0e-4
+  llrd: 0.75
+  epochs: 100
+  warmup_epochs: 8
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp2h_mae_difftokens_3layers.pt
+  device: cuda
+  distill:
+    teacher_ckpt: ${hydra:runtime.cwd}/checkpoints/exp2c_mae_transformer.pt
+    alpha: 0.5
+    temperature: 4.0
+
+submission:
+  tta_clips: 3
+
+wandb:
+  enabled: true
+  run_name: exp2h_mae_difftokens_3layers
+  tags: [track1, stage2, mae, transformer, regularized, ema, cutmix, distill, difftokens, relational, real_val]

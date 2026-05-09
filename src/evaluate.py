@@ -37,7 +37,17 @@ def load_model_from_checkpoint(checkpoint: Dict[str, Any], device: torch.device)
         )
     cfg = OmegaConf.create(checkpoint["config"])
     model = build_model(cfg)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # Auxiliary heads (e.g. predict_next_cls_head) are attached after build_model
+    # in train.py and live in the checkpoint, but are unused at inference. Load
+    # non-strictly and surface any genuinely missing inference-side params.
+    missing, unexpected = model.load_state_dict(
+        checkpoint["model_state_dict"], strict=False
+    )
+    if missing:
+        print(f"[evaluate] WARNING: {len(missing)} missing keys (e.g. {missing[:3]})")
+    if unexpected:
+        print(f"[evaluate] dropped {len(unexpected)} unexpected (aux) keys "
+              f"(e.g. {unexpected[:3]})")
     model.to(device)
     model.eval()
     return model

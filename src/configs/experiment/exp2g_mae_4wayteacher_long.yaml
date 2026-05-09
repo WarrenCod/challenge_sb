@@ -1,0 +1,63 @@
+# @package _global_
+# Exp2g (Track 1): push exp2f's recipe harder on three axes.
+#   1. Teacher: single exp2c (in 2f) -> 4-way ensemble {2c, 2d, 2e, 2f}.
+#      Richer KD signal; 2f as a teacher is the strongest single soft-label
+#      source available (val 0.628). Same softmax_mean combine as exp2e.
+#   2. Schedule: epochs 100 -> 200, warmup 8 -> 16 (scaled with epochs).
+#      exp2d/e/f all kept improving until late; the 100-epoch budget was the
+#      ceiling, not the recipe. A 200-epoch cosine should let LR stay useful
+#      longer.
+#   3. Regularization: drop_path 0.2 -> 0.3, mixup_alpha 0.2 -> 0.5.
+#      Compensates for the longer schedule + stronger teacher (which can
+#      collapse the student onto the teacher's biases).
+# Everything else identical to 2f: same seed (1337), random_temporal_offset on,
+# same cutmix/cutmix_alpha, same EMA, same LLRD.
+defaults:
+  - override /model: vit_mae_transformer
+
+model:
+  spatial:
+    drop_path: 0.3
+  temporal:
+    dropout: 0.2
+
+dataset:
+  num_frames: 4
+  seed: 1337
+  random_temporal_offset: true
+
+training:
+  batch_size: 16
+  lr: 3.0e-4
+  llrd: 0.75
+  epochs: 200
+  warmup_epochs: 16
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup_alpha: 0.5
+  cutmix_alpha: 1.0
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp2g_mae_4wayteacher_long.pt
+  device: cuda
+  distill:
+    teacher_ckpt:
+      - ${hydra:runtime.cwd}/checkpoints/exp2c_mae_transformer.pt
+      - ${hydra:runtime.cwd}/checkpoints/exp2d_mae_distill_cutmix.pt
+      - ${hydra:runtime.cwd}/checkpoints/exp2e_mae_bornagain_ensembleteacher.pt
+      - ${hydra:runtime.cwd}/checkpoints/exp2f_mae_seed_temporaljitter.pt
+    combine: softmax_mean
+    alpha: 0.5
+    temperature: 4.0
+
+submission:
+  tta_clips: 3
+
+wandb:
+  enabled: true
+  run_name: exp2g_mae_4wayteacher_long
+  tags: [track1, stage2, mae, transformer, regularized, ema, cutmix, distill, ensemble_teacher, long_schedule]

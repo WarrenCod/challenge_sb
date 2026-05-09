@@ -1,0 +1,48 @@
+# @package _global_
+# exp2f (Track 1): exp2d recipe + fresh seed + train-time random temporal jitter.
+# Goal is ensemble diversity, not single-model peak val.
+# Two-axis change vs exp2d: dataset.seed 42 -> 1337 ;
+#   dataset.random_temporal_offset false -> true (train clips sample
+#   offset_frac ~ Uniform[0,1) per item; val/test unchanged).
+# Same teacher (exp2c only, single), same epochs (100), same regularization.
+defaults:
+  - override /model: vit_mae_transformer
+
+model:
+  spatial:
+    drop_path: 0.2
+  temporal:
+    dropout: 0.2
+
+dataset:
+  num_frames: 4
+  seed: 1337
+  random_temporal_offset: true
+
+training:
+  batch_size: 16
+  lr: 3.0e-4
+  llrd: 0.75
+  epochs: 100
+  warmup_epochs: 8
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp2f_mae_seed_temporaljitter.pt
+  device: cuda
+  distill:
+    teacher_ckpt: ${hydra:runtime.cwd}/checkpoints/exp2c_mae_transformer.pt
+    alpha: 0.5
+    temperature: 4.0
+
+wandb:
+  enabled: true
+  run_name: exp2f_mae_seed_temporaljitter
+  tags: [track1, stage2, mae, transformer, regularized, ema, cutmix, distill, seed, temporaljitter, ensemble_diversity]

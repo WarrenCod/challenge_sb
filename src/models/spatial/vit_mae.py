@@ -29,6 +29,55 @@ _VIT_VARIANTS = {
 }
 
 
+class SpaceTimeBlock(nn.Module):
+    """Wraps a timm spatial Block with a temporal-attention pre-pass.
+
+    Divided space-time attention: at each patch position, attend across the T
+    frames; then dispatch to the original (MAE-init) spatial Block. The
+    temporal MHA's output projection is zero-initialised so at step 0 the
+    wrapped block's forward is bit-identical to the underlying spatial Block
+    — exp2m's t=0 forward equals exp2k's, and any drift from the 41.6%
+    baseline must be earned by gradient updates.
+    """
+
+    def __init__(
+        self,
+        spatial_block: nn.Module,
+        embed_dim: int,
+        num_heads: int,
+        num_frames: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.num_frames = int(num_frames)
+        self.norm_t = nn.LayerNorm(embed_dim)
+        self.attn_t = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        nn.init.zeros_(self.attn_t.out_proj.weight)
+        nn.init.zeros_(self.attn_t.out_proj.bias)
+        self.temporal_pos = nn.Parameter(torch.zeros(1, self.num_frames, 1, embed_dim))
+        self.block = spatial_block
+
+    def forward(self, x: torch.Tensor, T: int) -> torch.Tensor:
+        if T != self.num_frames:
+            raise RuntimeError(
+                f"SpaceTimeBlock built for num_frames={self.num_frames}, got T={T}"
+            )
+        BT, N1, D = x.shape
+        B = BT // T
+        xt = x.view(B, T, N1, D) + self.temporal_pos
+        xt2 = xt.permute(0, 2, 1, 3).reshape(B * N1, T, D)
+        h = self.norm_t(xt2)
+        # fp32 softmax to match the rest of the project's stability fixes.
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            h_fp32 = h.float()
+            attn_out, _ = self.attn_t(h_fp32, h_fp32, h_fp32, need_weights=False)
+        xt2 = xt2 + attn_out.to(xt2.dtype)
+        xt = xt2.view(B, N1, T, D).permute(0, 2, 1, 3).reshape(BT, N1, D)
+        return self.block(xt)
+
+
 class ViTMAEEncoder(SpatialEncoder):
     def __init__(
         self,
@@ -36,12 +85,18 @@ class ViTMAEEncoder(SpatialEncoder):
         image_size: int = 224,
         checkpoint_path: Optional[str] = None,
         drop_path: float = 0.0,
+        return_all_tokens: bool = False,
+        space_time_layers: int = 0,
+        space_time_num_frames: int = 4,
     ) -> None:
         super().__init__()
         if variant not in _VIT_VARIANTS:
             raise ValueError(f"Unknown vit variant {variant}. Options: {list(_VIT_VARIANTS)}")
         v = _VIT_VARIANTS[variant]
 
+        self.return_all_tokens = bool(return_all_tokens)
+        self.space_time_layers = int(space_time_layers)
+        self.space_time_num_frames = int(space_time_num_frames)
         self.out_dim = v["embed_dim"]
         self.patch_embed = PatchEmbed(
             img_size=image_size,
@@ -66,6 +121,23 @@ class ViTMAEEncoder(SpatialEncoder):
         if checkpoint_path:
             self._load_mae_checkpoint(checkpoint_path)
 
+        if self.space_time_layers > 0:
+            depth = v["depth"]
+            K = self.space_time_layers
+            if K > depth:
+                raise ValueError(f"space_time_layers={K} > depth={depth}")
+            for i in range(depth - K, depth):
+                self.blocks[i] = SpaceTimeBlock(
+                    spatial_block=self.blocks[i],
+                    embed_dim=v["embed_dim"],
+                    num_heads=v["num_heads"],
+                    num_frames=self.space_time_num_frames,
+                )
+            print(
+                f"[vit_mae] wrapped last {K} block(s) "
+                f"({depth-K}..{depth-1}) as SpaceTimeBlock(T={self.space_time_num_frames})"
+            )
+
     def _load_mae_checkpoint(self, path: str) -> None:
         ck = torch.load(Path(path).resolve(), map_location="cpu", weights_only=False)
         state = ck.get("encoder_state_dict", ck)  # support raw dict too
@@ -88,8 +160,14 @@ class ViTMAEEncoder(SpatialEncoder):
         x = torch.cat([cls, x], dim=1)
 
         for blk in self.blocks:
-            x = blk(x)
+            if isinstance(blk, SpaceTimeBlock):
+                x = blk(x, T)
+            else:
+                x = blk(x)
         x = self.norm(x)
+        if self.return_all_tokens:
+            # x: (B*T, N+1, D) -> (B, T, N+1, D)
+            return x.view(B, T, x.shape[1], self.out_dim)
         cls_out = x[:, 0, :]                 # CLS token
         return cls_out.view(B, T, self.out_dim)
 

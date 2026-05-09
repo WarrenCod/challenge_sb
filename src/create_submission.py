@@ -119,33 +119,39 @@ def build_model_from_checkpoint(ckpt: Dict[str, Any]) -> torch.nn.Module:
 
 
 @torch.no_grad()
-def run_inference(
+def run_inference_softmax(
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
     total_videos: int,
-) -> List[int]:
-    """Run the model on the loader; print batch progress to stdout."""
+    pass_label: str = "",
+) -> torch.Tensor:
+    """Run the model on the loader; return per-clip softmax probabilities.
+
+    Returns a (N, K) CPU float32 tensor, where N = total_videos and K is the
+    number of classes. Order matches the loader (loader must be unshuffled).
+    Used by both the single-pass and TTA paths.
+    """
     model.eval()
-    preds: List[int] = []
+    parts: List[torch.Tensor] = []
     n_batches = len(loader)
-    # About 10 progress lines for long runs; at least every batch if tiny
     log_interval = max(1, n_batches // 10)
     processed = 0
     for batch_idx, (video_batch, _labels) in enumerate(loader, start=1):
         video_batch = video_batch.to(device)
         logits = model(video_batch)
-        batch_pred = logits.argmax(dim=1).cpu().tolist()
-        preds.extend(int(p) for p in batch_pred)
+        probs = torch.softmax(logits, dim=-1).float().cpu()
+        parts.append(probs)
         bs = video_batch.size(0)
         processed += bs
         if batch_idx % log_interval == 0 or batch_idx == n_batches:
+            tag = f"{pass_label} " if pass_label else ""
             print(
-                f"  Inference batch {batch_idx}/{n_batches} "
+                f"  {tag}Inference batch {batch_idx}/{n_batches} "
                 f"({processed}/{total_videos} clips)",
                 flush=True,
             )
-    return preds
+    return torch.cat(parts, dim=0)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
@@ -167,7 +173,14 @@ def main(cfg: DictConfig) -> None:
     print(f"Loading checkpoint: {checkpoint_path}", flush=True)
     ckpt: Dict[str, Any] = torch.load(checkpoint_path, map_location="cpu")
     model = build_model_from_checkpoint(ckpt)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # Aux heads (e.g. predict_next_cls_head) are attached only during training;
+    # they live in the checkpoint but the inference model doesn't rebuild them.
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if missing:
+        print(f"[submission] WARNING: {len(missing)} missing keys (e.g. {missing[:3]})", flush=True)
+    if unexpected:
+        print(f"[submission] dropped {len(unexpected)} unexpected (aux) keys "
+              f"(e.g. {unexpected[:3]})", flush=True)
     model.to(device)
     print(f"Model on device: {device}", flush=True)
 
@@ -201,27 +214,57 @@ def main(cfg: DictConfig) -> None:
         )
     sample_list: List[Tuple[Path, int]] = [(p, 0) for p in video_dirs]
 
-    dataset = VideoFrameDataset(
-        root_dir=test_root,
-        num_frames=num_frames,
-        transform=eval_transform,
-        sample_list=sample_list,
-    )
-    batch_size = int(cfg.training.batch_size)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=int(cfg.training.num_workers),
-        pin_memory=(device.type == "cuda"),
-    )
+    submission_cfg = cfg.get("submission", None)
+    tta_clips = 1
+    dump_probs = False
+    if submission_cfg is not None:
+        tta_clips = int(submission_cfg.get("tta_clips", 1))
+        dump_probs = bool(submission_cfg.get("dump_probs", False))
+    if tta_clips < 1:
+        raise ValueError(f"submission.tta_clips must be >= 1, got {tta_clips}")
 
-    print(
-        f"Starting inference: {len(dataset)} clips, batch_size={batch_size}, "
-        f"{len(loader)} batches",
-        flush=True,
-    )
-    predictions = run_inference(model, loader, device, total_videos=len(dataset))
+    # N distinct temporal offsets evenly spread over [0, 1) for TTA. With
+    # tta_clips=1 we get offset_frac=0.0, i.e. the historical single-pass path.
+    offsets = [k / tta_clips for k in range(tta_clips)]
+    batch_size = int(cfg.training.batch_size)
+
+    accum: torch.Tensor | None = None
+    for pass_idx, offset in enumerate(offsets, start=1):
+        dataset = VideoFrameDataset(
+            root_dir=test_root,
+            num_frames=num_frames,
+            transform=eval_transform,
+            sample_list=sample_list,
+            frame_offset_frac=offset,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=int(cfg.training.num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
+        pass_label = (
+            f"[tta {pass_idx}/{tta_clips} offset={offset:.3f}]"
+            if tta_clips > 1
+            else ""
+        )
+        if pass_idx == 1:
+            print(
+                f"Starting inference: {len(dataset)} clips, batch_size={batch_size}, "
+                f"{len(loader)} batches, tta_clips={tta_clips}",
+                flush=True,
+            )
+        else:
+            print(f"  TTA pass {pass_idx}/{tta_clips} (offset_frac={offset:.3f})", flush=True)
+        probs = run_inference_softmax(
+            model, loader, device, total_videos=len(dataset), pass_label=pass_label
+        )
+        accum = probs if accum is None else accum + probs
+
+    assert accum is not None
+    avg_probs = accum / float(tta_clips)
+    predictions: List[int] = avg_probs.argmax(dim=-1).tolist()
     print("Inference finished.", flush=True)
 
     if len(predictions) != len(video_names):
@@ -238,6 +281,20 @@ def main(cfg: DictConfig) -> None:
             w.writerow([name, pred])
 
     print(f"Done. Wrote {len(predictions)} rows to {output_path}", flush=True)
+
+    if dump_probs:
+        import numpy as np
+        probs_path = output_path.with_suffix(".probs.npy")
+        names_path = output_path.with_suffix(".names.txt")
+        np.save(probs_path, avg_probs.numpy())
+        with names_path.open("w", encoding="utf-8") as f:
+            for name in video_names:
+                f.write(name + "\n")
+        print(
+            f"Dumped probs: {probs_path} (shape={tuple(avg_probs.shape)}); "
+            f"names: {names_path}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,53 @@
+# @package _global_
+# Exp2e (Track 1): exp2d + born-again teacher = ensemble(exp2c, exp2d).
+# alpha bumped 0.5 -> 0.7 (teacher stronger), epochs 100 -> 120 (lengthen the
+# cosine window so the plateau shifts later — exp2d plateaued at ep 83/100,
+# likely LR-floor limited; a stronger teacher signal should keep paying off
+# for longer if the LR doesn't collapse first).
+# 3-clip temporal TTA at submission (independent flag, not used at train time).
+# Single-axis change vs exp2d on the teacher only; everything else identical.
+defaults:
+  - override /model: vit_mae_transformer
+
+model:
+  spatial:
+    drop_path: 0.2
+  temporal:
+    dropout: 0.2
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 16
+  lr: 3.0e-4
+  llrd: 0.75
+  epochs: 120
+  warmup_epochs: 8
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp2e_mae_bornagain_ensembleteacher.pt
+  device: cuda
+  distill:
+    teacher_ckpt:
+      - ${hydra:runtime.cwd}/checkpoints/exp2c_mae_transformer.pt
+      - ${hydra:runtime.cwd}/checkpoints/exp2d_mae_distill_cutmix.pt
+    combine: softmax_mean
+    alpha: 0.7
+    temperature: 4.0
+
+submission:
+  tta_clips: 3
+
+wandb:
+  enabled: true
+  run_name: exp2e_mae_bornagain_ensembleteacher
+  tags: [track1, stage2, mae, transformer, regularized, ema, cutmix, distill, bornagain, ensemble_teacher]

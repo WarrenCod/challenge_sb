@@ -1,0 +1,58 @@
+# @package _global_
+# exp2m (Track 1): exp2k recipe + TimeSformer-style divided space-time
+# attention in the last 4 ViT-S blocks. The only architectural change vs
+# exp2k is in the backbone: each of blocks 9..12 now runs a temporal-attn
+# pre-pass over T tokens at each patch position before its (MAE-init)
+# spatial attn + MLP.
+#
+# Init guarantee: the temporal MHA's output projection is zero-init, so the
+# wrapped block's t=0 forward is bit-identical to exp2k's spatial-only
+# block. Any drift from the 41.6% baseline is earned by gradient steps.
+defaults:
+  - override /model: vit_mae_st_perceiver
+
+model:
+  spatial:
+    drop_path: 0.2
+  temporal:
+    dropout: 0.2
+
+dataset:
+  num_frames: 4
+  seed: 1337
+  random_temporal_offset: true
+
+training:
+  batch_size: 16
+  lr: 1.5e-4
+  llrd: 0.75
+  epochs: 100
+  warmup_epochs: 12
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 0.5
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp2m_st_perceiver.pt
+  device: cuda
+  distill:
+    teacher_ckpt: ${hydra:runtime.cwd}/checkpoints/exp2c_mae_transformer.pt
+    alpha: 0.5
+    temperature: 4.0
+  predict_next_cls:
+    enabled: true
+    weight: 0.1
+    hidden_dim: 512
+
+submission:
+  tta_clips: 3
+
+wandb:
+  enabled: true
+  run_name: exp2m_st_perceiver
+  tags: [track1, stage2, mae, perceiver, timesformer, spacetime, distill, ema, cutmix, real_val]

@@ -34,6 +34,8 @@ from models.temporal.diff_transformer import DiffTransformerTemporal
 from models.temporal.dual_stream_transformer import DualStreamTransformerTemporal
 from models.temporal.lstm import LSTMTemporal
 from models.temporal.mean_pool import MeanPoolTemporal
+from models.temporal.perceiver import PerceiverHead
+from models.temporal.relational_transformer import RelationalTransformerTemporal
 from models.temporal.transformer import TransformerTemporal
 
 try:
@@ -56,6 +58,8 @@ TEMPORAL_REGISTRY: Dict[str, type] = {
     "transformer": TransformerTemporal,
     "diff_transformer": DiffTransformerTemporal,
     "dual_stream_transformer": DualStreamTransformerTemporal,
+    "relational_transformer": RelationalTransformerTemporal,
+    "perceiver": PerceiverHead,
 }
 CLASSIFIER_REGISTRY: Dict[str, type] = {
     "linear": LinearClassifier,
@@ -89,18 +93,38 @@ class ModularVideoModel(nn.Module):
         self.aux_head: nn.Module | None = None  # optional per-frame deep-supervision head
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
-        frame_features = self.spatial(video)       # (B, T, d)
+        frame_features = self.spatial(video)       # (B, T, d) or (B, T, N+1, d)
         video_vector = self.temporal(frame_features)  # (B, d')
         return self.classifier(video_vector)       # (B, num_classes)
+
+    @staticmethod
+    def _per_frame_cls(frame_features: torch.Tensor) -> torch.Tensor:
+        """Extract (B, T, D) per-frame CLS from either spatial output shape."""
+        if frame_features.dim() == 4:
+            # (B, T, N+1, D) — CLS is index 0 of the token axis.
+            return frame_features[:, :, 0, :]
+        return frame_features
 
     def forward_with_aux(self, video: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # Returns (main_logits (B, K), aux_logits (B, T, K)).
         # Only valid when self.aux_head is set; train.py guards the call.
-        frame_features = self.spatial(video)            # (B, T, d)
+        frame_features = self.spatial(video)            # (B, T, d) or (B, T, N+1, d)
         video_vector = self.temporal(frame_features)    # (B, d')
         main_logits = self.classifier(video_vector)     # (B, K)
-        aux_logits = self.aux_head(frame_features)      # (B, T, K)
+        aux_logits = self.aux_head(self._per_frame_cls(frame_features))  # (B, T, K)
         return main_logits, aux_logits
+
+    def forward_with_cls(self, video: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (main_logits, per_frame_cls (B, T, D)).
+
+        Used by predict-next-CLS auxiliary loss in train.py: needs both the
+        main classifier output (for CE/KD) and the per-frame CLS tokens (as
+        the aux head's inputs and stopgrad target).
+        """
+        frame_features = self.spatial(video)
+        video_vector = self.temporal(frame_features)
+        main_logits = self.classifier(video_vector)
+        return main_logits, self._per_frame_cls(frame_features)
 
 
 class AuxFrameHead(nn.Module):

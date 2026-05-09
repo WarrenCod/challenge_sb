@@ -33,6 +33,7 @@ from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from models.cmt import CMT
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
+from models.aux.predict_next_cls import PredictNextCLSAuxHead
 from models.modular import attach_aux_head, build_modular_model
 from utils import (
     ModelEMA,
@@ -108,6 +109,41 @@ def load_teacher(checkpoint_path: Path, device: torch.device) -> nn.Module:
     return teacher
 
 
+class EnsembleTeacher(nn.Module):
+    """Wraps several frozen teachers; returns logits-space tensor for KD.
+
+    Two combine modes (the downstream code in `_forward_loss` does
+    ``softmax(teacher_out / T)``, so we always return something on a
+    logits-like scale):
+
+    - ``mean_logits``    : average per-teacher logits.
+    - ``softmax_mean``   : average per-teacher softmax probabilities, then
+                           ``log()`` so the downstream ``softmax(/T)`` divides
+                           the (log-)probabilities by T as expected.
+    """
+
+    def __init__(self, teachers: list[nn.Module], combine: str = "softmax_mean") -> None:
+        super().__init__()
+        if len(teachers) == 0:
+            raise ValueError("EnsembleTeacher needs at least one teacher.")
+        if combine not in ("mean_logits", "softmax_mean"):
+            raise ValueError(f"unknown combine mode: {combine}")
+        self.teachers = nn.ModuleList(teachers)
+        self.combine = combine
+        for t in self.teachers:
+            t.eval()
+            t.requires_grad_(False)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        outs = [t(x) for t in self.teachers]
+        if self.combine == "mean_logits":
+            return torch.stack(outs, dim=0).mean(dim=0)
+        # softmax_mean: average probabilities, return as log-probs.
+        probs = torch.stack([F.softmax(o, dim=-1) for o in outs], dim=0).mean(dim=0)
+        return torch.log(probs.clamp_min(1e-8))
+
+
 def train_one_epoch(
     model: nn.Module,
     data_loader: DataLoader,
@@ -124,6 +160,7 @@ def train_one_epoch(
     cutmix_alpha: float = 0.0,
     ema: Optional[ModelEMA] = None,
     aux_loss_weight: float = 0.0,
+    predict_next_cls_weight: float = 0.0,
     teacher: Optional[nn.Module] = None,
     distill_alpha: float = 0.0,
     distill_temperature: float = 1.0,
@@ -139,6 +176,10 @@ def train_one_epoch(
     total = 0
 
     use_aux = aux_loss_weight > 0.0 and getattr(model, "aux_head", None) is not None
+    use_predict_next_cls = (
+        predict_next_cls_weight > 0.0
+        and getattr(model, "predict_next_cls_head", None) is not None
+    )
     use_distill = teacher is not None and distill_alpha > 0.0
 
     def _forward_loss(video, y_a, y_b, lam):
@@ -151,6 +192,11 @@ def train_one_epoch(
             yb_rep = y_b.repeat_interleave(T)
             aux = lam * loss_fn(flat, ya_rep) + (1.0 - lam) * loss_fn(flat, yb_rep)
             loss = main + aux_loss_weight * aux
+        elif use_predict_next_cls:
+            logits, frame_cls = model.forward_with_cls(video)  # (B,K), (B,T,D)
+            main = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+            pred_loss = model.predict_next_cls_head(frame_cls)  # scalar
+            loss = main + predict_next_cls_weight * pred_loss
         else:
             logits = model(video)
             loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
@@ -165,6 +211,8 @@ def train_one_epoch(
         return logits, loss
 
     bar = tqdm(data_loader, desc=f"{epoch_label} train", leave=False, dynamic_ncols=True)
+    nan_streak = 0
+    MAX_NAN_STREAK = 20
     for video_batch, labels in bar:
         # video_batch: (B, T, C, H, W), labels: (B,)
         video_batch = video_batch.to(device, non_blocking=True)
@@ -189,6 +237,14 @@ def train_one_epoch(
         if amp and scaler is not None:
             with autocast(device_type=device.type, dtype=amp_dtype):
                 logits, loss = _forward_loss(video_batch, y_a, y_b, lam)
+            if not torch.isfinite(loss):
+                nan_streak += 1
+                if nan_streak >= MAX_NAN_STREAK:
+                    raise RuntimeError(
+                        f"Training diverged: {nan_streak} consecutive non-finite losses."
+                    )
+                continue
+            nan_streak = 0
             scaler.scale(loss).backward()
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -202,12 +258,28 @@ def train_one_epoch(
             # bf16 path: no grad scaler needed.
             with autocast(device_type=device.type, dtype=amp_dtype):
                 logits, loss = _forward_loss(video_batch, y_a, y_b, lam)
+            if not torch.isfinite(loss):
+                nan_streak += 1
+                if nan_streak >= MAX_NAN_STREAK:
+                    raise RuntimeError(
+                        f"Training diverged: {nan_streak} consecutive non-finite losses."
+                    )
+                continue
+            nan_streak = 0
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         else:
             logits, loss = _forward_loss(video_batch, y_a, y_b, lam)
+            if not torch.isfinite(loss):
+                nan_streak += 1
+                if nan_streak >= MAX_NAN_STREAK:
+                    raise RuntimeError(
+                        f"Training diverged: {nan_streak} consecutive non-finite losses."
+                    )
+                continue
+            nan_streak = 0
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -286,23 +358,25 @@ def main(cfg: DictConfig) -> None:
     device = torch.device(device_str)
 
     train_dir = Path(cfg.dataset.train_dir).resolve()
-    all_samples = collect_video_samples(train_dir)
+    val_dir = Path(cfg.dataset.val_dir).resolve()
 
     # Keep only class folders whose names match the validation split — train/ contains
     # 23 extra folders under an older numeric scheme that duplicate canonical clips
     # under wrong labels; leaving them in poisons the CE signal.
-    val_dir = Path(cfg.dataset.val_dir).resolve()
     canonical_classes = {p.name for p in val_dir.iterdir() if p.is_dir()}
-    all_samples = [s for s in all_samples if s[0].parent.name in canonical_classes]
+
+    train_samples = collect_video_samples(train_dir)
+    train_samples = [s for s in train_samples if s[0].parent.name in canonical_classes]
+    val_samples = collect_video_samples(val_dir)
 
     max_samples = cfg.dataset.get("max_samples")
     if max_samples is not None:
-        all_samples = all_samples[: int(max_samples)]
-
-    train_samples, val_samples = split_train_val(
-        all_samples,
-        val_ratio=float(cfg.dataset.val_ratio),
-        seed=int(cfg.dataset.seed),
+        train_samples = train_samples[: int(max_samples)]
+        val_samples = val_samples[: int(max_samples)]
+    print(
+        f"[train] {len(train_samples)} train videos from {train_dir.name}/, "
+        f"{len(val_samples)} val videos from {val_dir.name}/ (real held-out set)",
+        flush=True,
     )
 
     # Match normalization to pretrained flag (ImageNet stats when using pretrained weights).
@@ -321,6 +395,7 @@ def main(cfg: DictConfig) -> None:
     # RandomErasing, all consistent across frames). Used when training a temporal model
     # like TSM where per-frame independent crops would scramble the motion signal.
     use_strong_aug = bool(cfg.training.get("strong_clip_aug", False))
+    random_temporal_offset = bool(cfg.dataset.get("random_temporal_offset", False))
     if use_strong_aug:
         train_clip_transform = build_strong_clip_transform(
             image_size=224, use_imagenet_norm=use_imagenet_norm
@@ -330,6 +405,7 @@ def main(cfg: DictConfig) -> None:
             num_frames=int(cfg.dataset.num_frames),
             clip_transform=train_clip_transform,
             sample_list=train_samples,
+            random_offset_frac=random_temporal_offset,
         )
     else:
         train_dataset = VideoFrameDataset(
@@ -337,9 +413,12 @@ def main(cfg: DictConfig) -> None:
             num_frames=int(cfg.dataset.num_frames),
             transform=train_transform,
             sample_list=train_samples,
+            random_offset_frac=random_temporal_offset,
         )
+    if random_temporal_offset:
+        print("[train] random_temporal_offset=True — train clips use Uniform[0,1) offset_frac per item.", flush=True)
     val_dataset = VideoFrameDataset(
-        root_dir=train_dir,
+        root_dir=val_dir,
         num_frames=int(cfg.dataset.num_frames),
         transform=eval_transform,
         sample_list=val_samples,
@@ -375,6 +454,28 @@ def main(cfg: DictConfig) -> None:
         model.aux_head = model.aux_head.to(device)
         aux_loss_weight = float(aux_cfg.get("weight", 0.3))
         print(f"[train] aux per-frame loss enabled (weight={aux_loss_weight})")
+
+    # Optional auxiliary "predict next CLS" head: from frames 1..T-1 spatial CLS,
+    # predict frame-T CLS via a small MLP, cosine loss vs stopgrad target. The
+    # head is attached as an attribute so LLRD/EMA pick it up automatically.
+    pnc_cfg = cfg.training.get("predict_next_cls", None)
+    predict_next_cls_weight = 0.0
+    if pnc_cfg is not None and bool(pnc_cfg.get("enabled", False)):
+        if cfg.model.name != "modular":
+            raise ValueError("training.predict_next_cls only supported for model.name=modular")
+        embed_dim = int(model.spatial.out_dim)
+        num_input_frames = int(cfg.dataset.num_frames) - 1
+        hidden_dim = int(pnc_cfg.get("hidden_dim", 512))
+        model.predict_next_cls_head = PredictNextCLSAuxHead(
+            embed_dim=embed_dim,
+            num_input_frames=num_input_frames,
+            hidden_dim=hidden_dim,
+        ).to(device)
+        predict_next_cls_weight = float(pnc_cfg.get("weight", 0.1))
+        print(
+            f"[train] predict-next-CLS aux enabled (weight={predict_next_cls_weight}, "
+            f"hidden={hidden_dim}, T_in={num_input_frames})"
+        )
 
     amp_enabled = bool(cfg.training.get("amp", False)) and device.type == "cuda"
     amp_dtype_str = str(cfg.training.get("amp_dtype", "fp16")).lower()
@@ -503,11 +604,25 @@ def main(cfg: DictConfig) -> None:
     distill_temperature = 1.0
     distill_cfg = cfg.training.get("distill", None)
     if distill_cfg is not None and distill_cfg.get("teacher_ckpt", None):
-        teacher_path = Path(str(distill_cfg.teacher_ckpt)).resolve()
-        if not teacher_path.is_file():
-            raise FileNotFoundError(f"distill.teacher_ckpt not found: {teacher_path}")
-        print(f"[train] loading teacher from {teacher_path}")
-        teacher = load_teacher(teacher_path, device)
+        raw_ckpt = distill_cfg.teacher_ckpt
+        # Accept either a single path or a list of paths (ensemble teacher).
+        if isinstance(raw_ckpt, (list, tuple)) or OmegaConf.is_list(raw_ckpt):
+            teacher_paths = [Path(str(p)).resolve() for p in raw_ckpt]
+        else:
+            teacher_paths = [Path(str(raw_ckpt)).resolve()]
+        for tp in teacher_paths:
+            if not tp.is_file():
+                raise FileNotFoundError(f"distill.teacher_ckpt not found: {tp}")
+        loaded = []
+        for tp in teacher_paths:
+            print(f"[train] loading teacher from {tp}")
+            loaded.append(load_teacher(tp, device))
+        if len(loaded) == 1:
+            teacher = loaded[0]
+        else:
+            combine = str(distill_cfg.get("combine", "softmax_mean"))
+            teacher = EnsembleTeacher(loaded, combine=combine).to(device)
+            print(f"[train] ensemble teacher: {len(loaded)} models, combine={combine}")
         distill_alpha = float(distill_cfg.get("alpha", 0.5))
         distill_temperature = float(distill_cfg.get("temperature", 4.0))
         print(
@@ -532,6 +647,7 @@ def main(cfg: DictConfig) -> None:
             cutmix_alpha=cutmix_alpha,
             ema=ema,
             aux_loss_weight=aux_loss_weight,
+            predict_next_cls_weight=predict_next_cls_weight,
             teacher=teacher,
             distill_alpha=distill_alpha,
             distill_temperature=distill_temperature,
@@ -563,6 +679,24 @@ def main(cfg: DictConfig) -> None:
             },
             step=epoch + 1,
         )
+
+        # Guard: refuse to overwrite _last.pt with a poisoned state. exp2k
+        # ran 50 epochs of NaN before being killed because nothing in the
+        # loop noticed. Exiting non-zero lets train_robust.sh re-launch and
+        # resume from the previous (healthy) _last.pt.
+        if not (math.isfinite(train_loss) and math.isfinite(val_loss)):
+            print(
+                f"[train] non-finite loss at epoch {epoch + 1} "
+                f"(train_loss={train_loss}, val_loss={val_loss}). "
+                f"Not overwriting {last_path}. Exiting 2 for watchdog respawn.",
+                flush=True,
+            )
+            try:
+                wandb_log({"train/diverged_epoch": epoch + 1})
+                finish_wandb()
+            except Exception:
+                pass
+            raise SystemExit(2)
 
         if val_acc > best_val_accuracy:
             best_val_accuracy = val_acc
