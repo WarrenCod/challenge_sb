@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # Wrap a training command so transient crashes auto-restart and resume from
-# checkpoints/<run>_last.pt. Combine with @reboot crontab for full robustness.
+# <run>_last.pt. Combine with @reboot crontab for full robustness.
 #
-# Usage (always inside tmux, so the loop survives SSH drops):
-#   tmux new -s mae   'bash scripts/train_robust.sh python src/pretrain_mae.py experiment=mae_pretrain'
-#   tmux new -s train 'bash scripts/train_robust.sh python src/train.py         experiment=baseline_pretrained'
+# Preferred launch (via scripts/launch.sh): nohup setsid daemon, survives SSH
+# drop AND tmux-server death (the latter killed v4 on 2026-05-08):
+#   bash scripts/launch.sh <experiment>
+#
+# Direct invocation (no launcher), if you need it:
+#   nohup setsid bash scripts/train_robust.sh python src/train.py experiment=foo \
+#       >> logs/foo.log 2>&1 < /dev/null & disown
 #
 # Stop everything (and prevent any restart, including @reboot):
-#   touch /Data/challenge_sb/STOP        # blocks this loop and the @reboot job
-#   tmux kill-session -t <name>          # kills the running python process
+#   touch /Data/challenge_sb/STOP        # blocks the next retry loop
+#   pkill -f 'src/train.py.*experiment=foo'   # kill the running python child
 #
 # Resume same run later (loads state from _last.pt automatically):
 #   rm /Data/challenge_sb/STOP
-#   tmux new -s <name> 'bash scripts/train_robust.sh <cmd>'
+#   bash scripts/launch.sh <experiment>
 #
 # Force a fresh run (three options, pick one):
 #   rm checkpoints/<run>_last.pt                              # wipe resume file
