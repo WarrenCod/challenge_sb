@@ -74,3 +74,11 @@ disown
 
 Same robust pattern as exp2k v2 final segment (parent = PID 1, immune to
 tmux/SSH death). @reboot crontab from exp2k still active.
+
+## Mid-train submission (2026-05-10 13:47)
+
+- Training still in progress (epoch 50/100, PID 306112) — not interrupted.
+- Source: `checkpoints/exp2m_st_perceiver.pt` (best-by-val so far, val_acc=0.4660 from earlier today). Snapshotted to `checkpoints/exp2m_st_perceiver.snapshot.pt` to avoid race with training; ran inference on the snapshot at `training.batch_size=4` to keep GPU headroom.
+- Output: `processed_data/submission_exp2m_mid_train.csv` (6913 rows).
+- Sanity: 32 unique classes predicted (class 27 correctly absent), top-1 class is 30 (605 preds), min nonzero class is 26 (19 preds). Distribution is broad — no pathological collapse.
+- Final submission will still be created by `scripts/submit_after_exp2m.sh` once training exits, against the (possibly-improved) `exp2m_st_perceiver.pt`.
