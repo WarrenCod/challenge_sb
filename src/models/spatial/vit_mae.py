@@ -85,6 +85,7 @@ class ViTMAEEncoder(SpatialEncoder):
         image_size: int = 224,
         checkpoint_path: Optional[str] = None,
         drop_path: float = 0.0,
+        drop_path_schedule: str = "constant",
         return_all_tokens: bool = False,
         space_time_layers: int = 0,
         space_time_num_frames: int = 4,
@@ -110,12 +111,26 @@ class ViTMAEEncoder(SpatialEncoder):
             _sincos_2d_posembed(v["embed_dim"], self.patch_embed.grid_size, cls_token=True),
             persistent=False,
         )
+        if drop_path_schedule == "constant":
+            dp_rates = [float(drop_path)] * v["depth"]
+        elif drop_path_schedule == "linear":
+            depth_m1 = max(1, v["depth"] - 1)
+            dp_rates = [float(drop_path) * i / depth_m1 for i in range(v["depth"])]
+        else:
+            raise ValueError(
+                f"drop_path_schedule must be 'constant' or 'linear'; got {drop_path_schedule!r}"
+            )
         self.blocks = nn.ModuleList(
             [
-                Block(v["embed_dim"], v["num_heads"], v["mlp_ratio"], qkv_bias=True, drop_path=drop_path)
-                for _ in range(v["depth"])
+                Block(v["embed_dim"], v["num_heads"], v["mlp_ratio"], qkv_bias=True, drop_path=dp_rates[i])
+                for i in range(v["depth"])
             ]
         )
+        if drop_path_schedule == "linear":
+            print(
+                f"[vit_mae] linear drop_path schedule: "
+                f"{dp_rates[0]:.3f} → {dp_rates[-1]:.3f} across {v['depth']} blocks"
+            )
         self.norm = nn.LayerNorm(v["embed_dim"])
 
         if checkpoint_path:

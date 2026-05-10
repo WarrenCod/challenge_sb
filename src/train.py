@@ -34,6 +34,7 @@ from models.cmt import CMT
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.aux.predict_next_cls import PredictNextCLSAuxHead
+from models.aux.predict_prev_cls import PredictPrevCLSAuxHead
 from models.modular import attach_aux_head, build_modular_model
 from utils import (
     ModelEMA,
@@ -102,7 +103,19 @@ def load_teacher(checkpoint_path: Path, device: torch.device) -> nn.Module:
         raise ValueError(f"Teacher checkpoint missing 'config': {checkpoint_path}")
     teacher_cfg = OmegaConf.create(ckpt["config"])
     teacher = build_model(teacher_cfg)
-    teacher.load_state_dict(ckpt["model_state_dict"])
+    # Use strict=False so we tolerate aux-head keys (predict_next_cls_head,
+    # predict_prev_cls_head, aux_head) that EMA may have mirrored into the
+    # saved state_dict but that aren't part of the rebuilt eval-time model.
+    missing, unexpected = teacher.load_state_dict(ckpt["model_state_dict"], strict=False)
+    aux_like = lambda k: any(k.startswith(p) for p in ("predict_next_cls_head.", "predict_prev_cls_head.", "aux_head."))
+    real_missing = [k for k in missing if not aux_like(k)]
+    real_unexpected = [k for k in unexpected if not aux_like(k)]
+    if real_missing or real_unexpected:
+        print(
+            f"[train] teacher load_state_dict: "
+            f"missing={real_missing[:3]} ({len(real_missing)}), "
+            f"unexpected={real_unexpected[:3]} ({len(real_unexpected)})"
+        )
     teacher.eval()
     teacher.requires_grad_(False)
     teacher.to(device)
@@ -161,6 +174,7 @@ def train_one_epoch(
     ema: Optional[ModelEMA] = None,
     aux_loss_weight: float = 0.0,
     predict_next_cls_weight: float = 0.0,
+    predict_prev_cls_weight: float = 0.0,
     teacher: Optional[nn.Module] = None,
     distill_alpha: float = 0.0,
     distill_temperature: float = 1.0,
@@ -180,6 +194,11 @@ def train_one_epoch(
         predict_next_cls_weight > 0.0
         and getattr(model, "predict_next_cls_head", None) is not None
     )
+    use_predict_prev_cls = (
+        predict_prev_cls_weight > 0.0
+        and getattr(model, "predict_prev_cls_head", None) is not None
+    )
+    use_cls_aux = use_predict_next_cls or use_predict_prev_cls
     use_distill = teacher is not None and distill_alpha > 0.0
 
     def _forward_loss(video, y_a, y_b, lam):
@@ -192,11 +211,14 @@ def train_one_epoch(
             yb_rep = y_b.repeat_interleave(T)
             aux = lam * loss_fn(flat, ya_rep) + (1.0 - lam) * loss_fn(flat, yb_rep)
             loss = main + aux_loss_weight * aux
-        elif use_predict_next_cls:
+        elif use_cls_aux:
             logits, frame_cls = model.forward_with_cls(video)  # (B,K), (B,T,D)
             main = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
-            pred_loss = model.predict_next_cls_head(frame_cls)  # scalar
-            loss = main + predict_next_cls_weight * pred_loss
+            loss = main
+            if use_predict_next_cls:
+                loss = loss + predict_next_cls_weight * model.predict_next_cls_head(frame_cls)
+            if use_predict_prev_cls:
+                loss = loss + predict_prev_cls_weight * model.predict_prev_cls_head(frame_cls)
         else:
             logits = model(video)
             loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
@@ -477,6 +499,28 @@ def main(cfg: DictConfig) -> None:
             f"hidden={hidden_dim}, T_in={num_input_frames})"
         )
 
+    # Optional auxiliary "predict prev CLS" head: mirror of predict-next with
+    # input=CLS at frames 1..T-1, target=stopgrad(CLS at frame 0). Same zero-init
+    # fc2, same fp32 cosine loss. Bidirectional aux signal.
+    ppc_cfg = cfg.training.get("predict_prev_cls", None)
+    predict_prev_cls_weight = 0.0
+    if ppc_cfg is not None and bool(ppc_cfg.get("enabled", False)):
+        if cfg.model.name != "modular":
+            raise ValueError("training.predict_prev_cls only supported for model.name=modular")
+        embed_dim = int(model.spatial.out_dim)
+        num_input_frames = int(cfg.dataset.num_frames) - 1
+        hidden_dim = int(ppc_cfg.get("hidden_dim", 512))
+        model.predict_prev_cls_head = PredictPrevCLSAuxHead(
+            embed_dim=embed_dim,
+            num_input_frames=num_input_frames,
+            hidden_dim=hidden_dim,
+        ).to(device)
+        predict_prev_cls_weight = float(ppc_cfg.get("weight", 0.1))
+        print(
+            f"[train] predict-prev-CLS aux enabled (weight={predict_prev_cls_weight}, "
+            f"hidden={hidden_dim}, T_in={num_input_frames})"
+        )
+
     amp_enabled = bool(cfg.training.get("amp", False)) and device.type == "cuda"
     amp_dtype_str = str(cfg.training.get("amp_dtype", "fp16")).lower()
     if amp_dtype_str in ("bf16", "bfloat16"):
@@ -558,9 +602,24 @@ def main(cfg: DictConfig) -> None:
         ema = ModelEMA(model, decay=ema_decay)
         print(f"[train] EMA enabled (decay={ema_decay})")
 
+    # Optional SWA: average end-of-epoch (EMA, if present, else live) weights
+    # across a plateau window. Saved at end-of-training as a separate ckpt.
+    # Not included in _last.pt resume state — on a crash mid-window, SWA
+    # restarts from scratch when training resumes.
+    swa_cfg = cfg.training.get("swa", None)
+    swa_enabled = swa_cfg is not None and bool(swa_cfg.get("enabled", False))
+    swa_start_epoch_1idx = int(swa_cfg.get("start_epoch", 0)) if swa_enabled else 0
+    swa_model: Optional[torch.optim.swa_utils.AveragedModel] = None
+
     best_val_accuracy = 0.0
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
     last_path = checkpoint_path.with_name(checkpoint_path.stem + "_last" + checkpoint_path.suffix)
+    swa_path = checkpoint_path.with_name(checkpoint_path.stem + "_swa" + checkpoint_path.suffix)
+    if swa_enabled:
+        print(
+            f"[train] SWA enabled (start at epoch {swa_start_epoch_1idx}, "
+            f"source={'EMA' if ema is not None else 'live'}, save to {swa_path})"
+        )
 
     init_wandb(cfg, default_run_name=checkpoint_path.stem)
 
@@ -648,6 +707,7 @@ def main(cfg: DictConfig) -> None:
             ema=ema,
             aux_loss_weight=aux_loss_weight,
             predict_next_cls_weight=predict_next_cls_weight,
+            predict_prev_cls_weight=predict_prev_cls_weight,
             teacher=teacher,
             distill_alpha=distill_alpha,
             distill_temperature=distill_temperature,
@@ -698,6 +758,16 @@ def main(cfg: DictConfig) -> None:
                 pass
             raise SystemExit(2)
 
+        # SWA update: snapshot current (EMA or live) weights into the running
+        # average once per epoch from swa_start onward. Done after the
+        # divergence guard above so we never average a NaN epoch.
+        if swa_enabled and (epoch + 1) >= swa_start_epoch_1idx:
+            swa_source = ema.module if ema is not None else model
+            if swa_model is None:
+                swa_model = torch.optim.swa_utils.AveragedModel(swa_source)
+                print(f"[train] SWA: started averaging at epoch {epoch + 1}", flush=True)
+            swa_model.update_parameters(swa_source)
+
         if val_acc > best_val_accuracy:
             best_val_accuracy = val_acc
             # When EMA is on, save the EMA weights (those are what just got val'd).
@@ -740,6 +810,25 @@ def main(cfg: DictConfig) -> None:
             },
             last_path,
         )
+
+    if swa_enabled and swa_model is not None:
+        n_avg = int(swa_model.n_averaged.item())
+        swa_payload: Dict[str, Any] = {
+            "model_state_dict": swa_model.module.state_dict(),
+            "model_name": cfg.model.name,
+            "num_classes": int(cfg.model.num_classes),
+            "pretrained": use_imagenet_norm,
+            "num_frames": int(cfg.dataset.num_frames),
+            "val_accuracy": -1.0,  # SWA wasn't val'd inline; run evaluate.py offline
+            "config": OmegaConf.to_container(cfg, resolve=True),
+            "swa_start_epoch": swa_start_epoch_1idx,
+            "swa_n_averaged": n_avg,
+        }
+        if cfg.model.name == "cnn_lstm":
+            swa_payload["lstm_hidden_size"] = int(cfg.model.get("lstm_hidden_size", 512))
+        atomic_torch_save(swa_payload, swa_path)
+        print(f"[train] saved SWA checkpoint ({n_avg} averages) to {swa_path}")
+        wandb_log({"swa/n_averaged": n_avg, "swa/start_epoch": swa_start_epoch_1idx})
 
     print(f"Done. Best validation accuracy: {best_val_accuracy:.4f}")
     wandb_log({"val/best_acc": best_val_accuracy})

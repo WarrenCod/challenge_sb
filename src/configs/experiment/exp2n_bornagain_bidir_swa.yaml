@@ -1,0 +1,80 @@
+# @package _global_
+# exp2n (Track 1): exp2m architecture, born-again distill from exp2m, plus a
+# bidirectional aux head (predict-prev-CLS alongside predict-next-CLS),
+# stronger regularization, shorter cosine schedule, and SWA over the plateau.
+#
+# The backbone (ViT-S/16 + K=4 divided ST blocks in the last 4 layers) and
+# head (Perceiver, 16 queries × 788 KV) are unchanged vs exp2m. Stage-1 init
+# (mae_stage1.pt) is unchanged. Every new piece is identity or zero-init at
+# step 0 — exp2n's first forward is bit-identical to exp2m's first forward.
+defaults:
+  - override /model: vit_mae_st_perceiver
+
+model:
+  spatial:
+    drop_path: 0.30
+    drop_path_schedule: linear   # 0.0 (block 0) → 0.30 (block 11), per-block
+  temporal:
+    dropout: 0.30                 # MHA dropout, applies inside SpaceTimeBlock & Perceiver
+
+dataset:
+  num_frames: 4
+  seed: 1337
+  random_temporal_offset: true
+
+training:
+  batch_size: 16
+  lr: 1.5e-4
+  llrd: 0.70                      # exp2m used 0.75; slightly more aggressive on early layers
+  epochs: 70                      # exp2m peaked at 61/100 → tighter budget
+  warmup_epochs: 8                # scale with shorter total
+  weight_decay: 0.05
+  label_smoothing: 0.15           # exp2m used 0.10
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 0.5
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp2n_bornagain_bidir_swa.pt
+  device: cuda
+  distill:
+    teacher_ckpt: ${hydra:runtime.cwd}/checkpoints/exp2m_st_perceiver.pt
+    alpha: 0.6                    # exp2m used 0.5; trust stronger teacher more
+    temperature: 4.0
+  predict_next_cls:
+    enabled: true
+    weight: 0.05                  # split with predict_prev to keep total aux = exp2m's 0.10
+    hidden_dim: 512
+  predict_prev_cls:
+    enabled: true
+    weight: 0.05
+    hidden_dim: 512
+  swa:
+    enabled: true
+    start_epoch: 35               # plateau window ep 35..70 (28 averages)
+
+submission:
+  tta_clips: 5
+
+wandb:
+  enabled: true
+  run_name: exp2n_bornagain_bidir_swa
+  tags:
+    [
+      track1,
+      stage2,
+      mae,
+      perceiver,
+      timesformer,
+      spacetime,
+      distill,
+      bornagain,
+      ema,
+      cutmix,
+      bidir_aux,
+      swa,
+      real_val,
+    ]
