@@ -1,0 +1,46 @@
+# @package _global_
+# Track-2: VideoMAE ViT-L/16, K400 supervised-finetuned, fine-tuned on the challenge clips.
+#
+# Sibling of videomae_b16_k400 with the L backbone substituted. Differences from B16:
+#   - hf_id swapped to ViT-L K400-supervised (see configs/model/videomae_l_k400.yaml).
+#   - image_size 320 -> 224 (memory cap on 24 GiB A5000).
+#   - batch_size 32 -> 16 (3x params, deeper activations).
+#   - lr 7e-4 -> 5e-4 (L is more sensitive; smaller batch also pushes LR down).
+#   - llrd 0.75 -> 0.85 (24 layers vs 12; slower decay keeps early layers learning).
+#   - drop_path 0.1 -> 0.2, head_dropout 0.2 -> 0.3 (L regularization).
+#   - epochs 40 -> 30 (B saturated by ~ep25; L should plateau earlier in epoch count).
+#   - warmup_epochs 3 -> 5 (deeper model, longer warmup).
+#
+# Constraints kept identical:
+#   - num_frames=4 (hard cap), no horizontal flip (SSv2 is direction-sensitive),
+#     mixup 0.2 (no cutmix — destroys motion cues), label smoothing 0.1, EMA 0.9998,
+#     RandAugment-style strong clip aug.
+defaults:
+  - override /model: videomae_l_k400
+
+dataset:
+  num_frames: 4
+
+training:
+  optimizer: adamw
+  batch_size: 16
+  num_workers: 8
+  lr: 5e-4
+  llrd: 0.85
+  epochs: 30
+  weight_decay: 0.05
+  warmup_epochs: 5
+  grad_clip: 1.0
+  amp: true
+  mixup_alpha: 0.2
+  label_smoothing: 0.1
+  strong_clip_aug: true
+  ema_decay: 0.9998
+  checkpoint_path: ${hydra:runtime.cwd}/best_videomae_l_k400.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  project: csc43m04ep
+  run_name: videomae-l-k400
+  tags: [track2, pretrained, videomae, vit_l16, joint_st]

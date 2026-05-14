@@ -1,0 +1,49 @@
+# @package _global_
+# Track-2: V-JEPA 2 ViT-L/16 with attentive-probe head (sibling of vjepa2_l_256).
+#
+# Replaces mean-pool over 512 space-time tokens with a 2-block, 16-query
+# attentive probe — the readout V-JEPA 2 itself uses for benchmark numbers.
+# Backbone + dataset + augmentation identical to vjepa2_l_256; only the
+# readout, head_lr_mult, ema_decay, head_dropout, and ckpt path differ.
+#
+# Hyperparam deltas vs vjepa2_l_256.yaml:
+#   - head_lr_mult 1.0 -> 5.0: cold-init probe needs faster lr than the
+#     LLRD-decayed backbone (deepest block at base_lr); 5x gives clean
+#     separation without the collapse risk of paper's 10x (which targets
+#     frozen backbones).
+#   - ema_decay 0.9998 -> 0.9995: 30 ep * ~140 batches = 4200 steps; EMA
+#     shadow at 0.9998 never catches a fresh probe. 0.9995 tracks closer.
+#   - head_dropout 0.3 -> 0.1: probe output is structured; less regularizer
+#     needed than for raw mean-pool features.
+#   - checkpoint_path -> best_vjepa2_l_256_probe.pt: must NOT collide with
+#     the existing best_vjepa2_l_256.pt.
+defaults:
+  - override /model: vjepa2_l_256_probe
+
+dataset:
+  num_frames: 4
+
+training:
+  optimizer: adamw
+  batch_size: 8
+  num_workers: 8
+  lr: 3e-4
+  llrd: 0.85
+  head_lr_mult: 5.0
+  epochs: 30
+  weight_decay: 0.05
+  warmup_epochs: 5
+  grad_clip: 1.0
+  amp: true
+  mixup_alpha: 0.2
+  label_smoothing: 0.1
+  strong_clip_aug: true
+  ema_decay: 0.9995
+  checkpoint_path: ${hydra:runtime.cwd}/best_vjepa2_l_256_probe.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  project: csc43m04ep
+  run_name: vjepa2-l-256-probe
+  tags: [track2, pretrained, vjepa2, vit_l16, ssl, joint_st, attn_probe]

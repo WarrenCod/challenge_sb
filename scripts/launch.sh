@@ -43,6 +43,16 @@ case "$ENTRY" in
     *) echo "unknown entry: $ENTRY (use pretrain|ibot|train)" >&2; exit 64 ;;
 esac
 
+# Resolve python explicitly to the project venv. Cron's PATH does NOT include
+# the uv-managed venv, so without this, cron-spawned restarts fall back to
+# system python and crash-loop with "No module named 'torch'" (happened
+# 2026-05-10 04:46→10:25 — burned 5h30 of GPU time before being noticed).
+PYTHON="${PYTHON:-/Data/challenge_sb/.venv/bin/python}"
+if [ ! -x "$PYTHON" ]; then
+    echo "[launch] FATAL: venv python not found at $PYTHON; run 'uv sync' first." >&2
+    exit 70
+fi
+
 git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)" || true
 mkdir -p logs
 
@@ -60,7 +70,7 @@ fi
 # Daemonize via `nohup setsid` so the watchdog survives SSH drop, parent-shell
 # exit, AND tmux-server death (which killed v4 on 2026-05-08). The process
 # becomes a session leader with no controlling terminal.
-nohup setsid bash -c "exec bash scripts/train_robust.sh python $SCRIPT experiment=$EXP" \
+nohup setsid bash -c "exec bash scripts/train_robust.sh $PYTHON $SCRIPT experiment=$EXP" \
     >> "$LOG" 2>&1 < /dev/null &
 DAEMON_PID=$!
 disown "$DAEMON_PID" 2>/dev/null || true

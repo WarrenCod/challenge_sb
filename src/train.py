@@ -33,6 +33,8 @@ from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.modular import build_modular_model
 from models.videomae import VideoMAEClassifier
+from models.vjepa2 import VJepa2Classifier
+from models.vjepa2_probe import VJepa2ProbeClassifier
 from utils import (
     ModelEMA,
     atomic_torch_save,
@@ -76,6 +78,30 @@ def build_model(cfg: DictConfig) -> nn.Module:
             image_size=int(cfg.model.get("image_size", 224)),
             drop_path=float(cfg.model.get("drop_path", 0.1)),
             head_dropout=float(cfg.model.get("head_dropout", 0.2)),
+        )
+    if name == "vjepa2":
+        return VJepa2Classifier(
+            num_classes=num_classes,
+            hf_id=str(cfg.model.get("hf_id", "facebook/vjepa2-vitl-fpc64-256")),
+            pretrained=bool(cfg.model.pretrained),
+            num_frames=int(cfg.dataset.num_frames),
+            image_size=int(cfg.model.get("image_size", 256)),
+            drop_path=float(cfg.model.get("drop_path", 0.2)),
+            head_dropout=float(cfg.model.get("head_dropout", 0.3)),
+        )
+    if name == "vjepa2_probe":
+        return VJepa2ProbeClassifier(
+            num_classes=num_classes,
+            hf_id=str(cfg.model.get("hf_id", "facebook/vjepa2-vitl-fpc64-256")),
+            pretrained=bool(cfg.model.pretrained),
+            num_frames=int(cfg.dataset.num_frames),
+            image_size=int(cfg.model.get("image_size", 256)),
+            drop_path=float(cfg.model.get("drop_path", 0.2)),
+            head_dropout=float(cfg.model.get("head_dropout", 0.1)),
+            probe_n_blocks=int(cfg.model.get("probe_n_blocks", 2)),
+            probe_n_queries=int(cfg.model.get("probe_n_queries", 16)),
+            probe_n_heads=int(cfg.model.get("probe_n_heads", 16)),
+            probe_mlp_ratio=int(cfg.model.get("probe_mlp_ratio", 4)),
         )
     if name == "cmt":
         return CMT(
@@ -323,14 +349,17 @@ def main(cfg: DictConfig) -> None:
         )
         print(f"[train] SGD optimizer (lr={cfg.training.lr}, momentum={cfg.training.get('momentum', 0.9)})")
     elif llrd > 0.0:
+        head_lr_mult = float(cfg.training.get("head_lr_mult", 1.0))
         groups = build_llrd_param_groups(
             model,
             base_lr=float(cfg.training.lr),
             decay_rate=llrd,
             weight_decay=weight_decay,
+            head_lr_mult=head_lr_mult,
         )
         optimizer = torch.optim.AdamW(groups)
-        print(f"[train] AdamW + LLRD (decay={llrd}): {len(groups)} param groups")
+        mult_str = f", head_lr_mult={head_lr_mult}" if head_lr_mult != 1.0 else ""
+        print(f"[train] AdamW + LLRD (decay={llrd}{mult_str}): {len(groups)} param groups")
     else:
         optimizer = torch.optim.AdamW(
             model.parameters(),

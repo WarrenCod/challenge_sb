@@ -1,0 +1,24 @@
+# @package _global_
+# VideoMAE ViT-L/16, K400 *supervised*-finetuned (HuggingFace MCG-NJU/videomae-large-finetuned-kinetics).
+#
+# Why this checkpoint vs the SSL-only base:
+#   - The B16 recipe uses MCG-NJU/videomae-base = SSL pretrain only.
+#     Good for "no class-bias leak" but weaker action-classification init.
+#   - The L variant we want is the *supervised* K400 finetune. K400 actions
+#     are not SSv2 classes (no overlap), so there's no leak — but the
+#     features are already tuned for action classification, which gives a
+#     meaningfully better start when our compute budget is finite.
+#   - VideoMAEModel.from_pretrained discards the 400-class head automatically
+#     (the head lives in VideoMAEForVideoClassification, not VideoMAEModel).
+#
+# Memory: L at 224^2 x 4 frames runs ~12 GiB peak with batch=16 + AMP.
+# 320^2 OOMs at any reasonable batch on a 24 GiB A5000, so we drop back
+# to native 224^2.
+model:
+  name: videomae
+  num_classes: ${num_classes}
+  hf_id: MCG-NJU/videomae-large-finetuned-kinetics
+  pretrained: true
+  image_size: 224          # L has 24 layers + embed_dim=1024; can't afford 320
+  drop_path: 0.2           # standard ViT-L regularization
+  head_dropout: 0.3        # head is 1024-d not 768-d

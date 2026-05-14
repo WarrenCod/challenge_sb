@@ -1,0 +1,19 @@
+# @package _global_
+# V-JEPA 2 ViT-L/16, SSL-pretrained on web video (HuggingFace facebook/vjepa2-vitl-fpc64-256).
+#
+# Diverse pretraining family vs the VideoMAE-L K400 leader: V-JEPA 2 is SSL-only
+# (no supervised K400 head), trained at 64 frames / 256 px. We fine-tune at our
+# 4-frame cap and the native 256 px crop — RoPE attention makes the positional
+# encoding parameter-free so changing frames_per_clip / crop_size from pretrain
+# stays in-distribution (no pos-embed interpolation).
+#
+# Memory: ViT-L at 256^2 x 4 frames + fp16 + mixup runs ~18-20 GiB at batch=8.
+# ViT-H ruled out at 24 GiB budget.
+model:
+  name: vjepa2
+  num_classes: ${num_classes}
+  hf_id: facebook/vjepa2-vitl-fpc64-256
+  pretrained: true
+  image_size: 256          # V-JEPA 2 native res
+  drop_path: 0.2           # standard ViT-L regularization
+  head_dropout: 0.3        # head sees raw SSL features (less calibrated than K400-supervised)

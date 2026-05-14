@@ -1,0 +1,19 @@
+# @package _global_
+# V-JEPA 2 ViT-L/16 (SSL-pretrained, HF facebook/vjepa2-vitl-fpc64-256)
+# with a multi-block attentive probe head — replaces the mean-pool used in
+# vjepa2_l_256.yaml. K learnable queries cross-attend over encoder tokens
+# through N blocks of {cross-attn -> self-attn -> MLP}, then mean over K.
+#
+# Sibling of vjepa2_l_256; backbone untouched, only the readout differs.
+model:
+  name: vjepa2_probe
+  num_classes: ${num_classes}
+  hf_id: facebook/vjepa2-vitl-fpc64-256
+  pretrained: true
+  image_size: 256
+  drop_path: 0.2          # backbone drop_path (same as mean-pool variant)
+  head_dropout: 0.1       # probe output is more calibrated than raw mean
+  probe_n_blocks: 2       # LLRD already adapts deep backbone -> 2 probe blocks suffice
+  probe_n_queries: 16
+  probe_n_heads: 16       # d=1024 / 16 = d_head=64
+  probe_mlp_ratio: 4

@@ -67,7 +67,11 @@ class VideoMAEEncoderWrap(nn.Module):
         yield ("embed", self.encoder.embeddings)
         for i, blk in enumerate(self.encoder.encoder.layer):
             yield (f"block_{i}", blk)
-        yield ("norm", self.encoder.layernorm)
+        # K400-supervised checkpoints set use_mean_pooling=True; in that case
+        # HF skips encoder.layernorm (the final norm lives in the classifier
+        # head, which we replace with our own head_norm in VideoMAEClassifier).
+        if self.encoder.layernorm is not None:
+            yield ("norm", self.encoder.layernorm)
 
 
 class VideoMAEClassifier(nn.Module):

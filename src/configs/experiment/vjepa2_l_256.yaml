@@ -1,0 +1,45 @@
+# @package _global_
+# Track-2: V-JEPA 2 ViT-L/16 (SSL-only) fine-tuned on the challenge clips.
+#
+# Parallel to videomae_l_k400 — same size class, different pretraining prior
+# (SSL web video vs K400 supervised). Goal: standalone target real-val 0.60-0.66
+# and an uncorrelated ensemble partner for VideoMAE-L (0.5899 real-val).
+#
+# Hyperparam deltas vs videomae_l_k400.yaml:
+#   - lr 5e-4 -> 3e-4: V-JEPA 2 is SSL-only, backbone is "rawer" than K400-supervised.
+#   - batch_size 16 -> 8: 256 px (vs 224) + RoPE 512-token attention + mixup.
+#   - image_size 224 -> 256: V-JEPA 2 native crop_size.
+#
+# Constraints kept identical:
+#   - num_frames=4 (hard cap), no horizontal flip (SSv2 direction-sensitive),
+#     mixup 0.2, label smoothing 0.1, EMA 0.9998, RandAugment-style strong clip aug,
+#     fp16 AMP, LLRD 0.85 (same 24-block depth), warmup_epochs 5.
+defaults:
+  - override /model: vjepa2_l_256
+
+dataset:
+  num_frames: 4
+
+training:
+  optimizer: adamw
+  batch_size: 8
+  num_workers: 8
+  lr: 3e-4
+  llrd: 0.85
+  epochs: 30
+  weight_decay: 0.05
+  warmup_epochs: 5
+  grad_clip: 1.0
+  amp: true
+  mixup_alpha: 0.2
+  label_smoothing: 0.1
+  strong_clip_aug: true
+  ema_decay: 0.9998
+  checkpoint_path: ${hydra:runtime.cwd}/best_vjepa2_l_256.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  project: csc43m04ep
+  run_name: vjepa2-l-256
+  tags: [track2, pretrained, vjepa2, vit_l16, ssl, joint_st]

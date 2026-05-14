@@ -98,7 +98,8 @@ def build_llrd_param_groups(
     base_lr: float,
     decay_rate: float = 0.75,
     weight_decay: float = 0.05,
-    no_decay_names: Tuple[str, ...] = ("bias", "cls_token", "pos_embed"),
+    no_decay_names: Tuple[str, ...] = ("bias", "cls_token", "pos_embed", "queries"),
+    head_lr_mult: float = 1.0,
 ) -> List[dict]:
     """
     Layer-wise LR decay for a modular video model with a ViT-MAE spatial slot.
@@ -106,9 +107,11 @@ def build_llrd_param_groups(
     Layers ordered shallowest (patch_embed) → deepest (final norm); depth D.
     Each layer gets lr = base_lr * decay_rate ** (D - i), so the deepest encoder
     layer is ``base_lr`` and the patch_embed gets the most decayed rate.
-    Temporal + classifier heads get ``base_lr`` unscaled.
+    Temporal + classifier heads get ``base_lr * head_lr_mult``.
 
-    1-D params (LayerNorm, bias, CLS / pos-embed) get weight_decay=0.
+    1-D params (LayerNorm, bias, CLS / pos-embed) and any param whose name contains
+    a token in ``no_decay_names`` (e.g. ``queries`` for an attentive probe) get
+    weight_decay=0.
     """
     if not hasattr(model, "spatial") or not hasattr(model.spatial, "ordered_layers"):
         raise ValueError(
@@ -171,10 +174,11 @@ def build_llrd_param_groups(
             head_nodecay.append(p)
         else:
             head_decay.append(p)
+    head_lr = base_lr * head_lr_mult
     if head_decay:
-        groups.append({"params": head_decay, "lr": base_lr, "weight_decay": weight_decay, "group": "head.decay"})
+        groups.append({"params": head_decay, "lr": head_lr, "weight_decay": weight_decay, "group": "head.decay"})
     if head_nodecay:
-        groups.append({"params": head_nodecay, "lr": base_lr, "weight_decay": 0.0, "group": "head.no_decay"})
+        groups.append({"params": head_nodecay, "lr": head_lr, "weight_decay": 0.0, "group": "head.no_decay"})
 
     return groups
 
