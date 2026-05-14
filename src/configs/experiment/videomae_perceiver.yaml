@@ -1,0 +1,63 @@
+# @package _global_
+# Stage 2c — VideoMAE encoder + Perceiver head over the FULL 392 space-time tokens.
+# Entry point: `python src/train.py experiment=videomae_perceiver`
+defaults:
+  - override /model: videomae_perceiver
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 32
+  # 2× meanpool's lr: Perceiver head is ~7 M random params and needs to converge
+  # faster than the trunk's LLRD-attenuated rate. LLRD 0.75 still scales block_0
+  # down to ~3e-4 · 0.75^11 ≈ 1.4e-5 (well below 5e-4 head LR).
+  lr: 3.0e-4
+  llrd: 0.75
+  epochs: 120
+  warmup_epochs: 8
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 0.5                  # tighter than meanpool's 1.0 — cross-attn step-0 spike protection
+
+  aug_strength: videomae          # clip-consistent RRC + CJ; no RA, no RE, no flips — SSv2-safe.
+  mixup_alpha: 0.2
+  cutmix_alpha: 0.0               # direction-sensitive labels — never.
+
+  freeze_backbone_epochs: 8       # LP-FT: head is 7 M random params; longer burn-in than meanpool's 5.
+
+  ema: true
+  ema_decay: 0.999
+  distill_alpha: 0.3              # softer self-distill so the head has early freedom.
+  distill_temperature: 2.0
+  eval_on_ema: false              # report live-student val (parity with prior leaderboards).
+
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/videomae_perceiver.pt
+  device: cuda
+  resume: true
+
+wandb:
+  enabled: true
+  run_name: videomae_perceiver_v1
+  run_id: videomae_perceiver_v1
+  tags: [track1, stage2, videomae, perceiver, lpft, distill, full_tokens]
+  notes: |
+    Stage 2c — VideoMAE-S/16 + Perceiver head over the FULL 392 space-time tokens
+    (vs 2a/2b which saw only 2 spatial-mean-pooled tubelet vectors).
+    120 ep, batch 32, bf16, LLRD 0.75, LP-FT 8 ep, mixup 0.2, drop_path 0.2,
+    self-distill α=0.3 T=2.
+
+    Sketch:
+      Clip(B,4,3,224,224)
+        → TubeletEmbed Conv3d(t=2,p=16) + 3D sincos pos-embed
+        → 12 × ViT-S/16 Block (drop_path=0.2)
+        → (B, 392, 384) ── LN
+        → reshape (B, T'=2, HW=196, 384) + learnable temporal_pos (zero-init)
+        → flatten KV (B, 392, 384)
+        → PerceiverHead [Q=16 → CrossAttn(fp32 softmax, h=6, mlp×4) → SA×3]
+        → mean over 16 queries → Linear(384, 33)
+
+    Loss = (1-α)·CE_lsm(0.1) + α·KL(student || EMA(student) / T)  with α=0.3, T=2

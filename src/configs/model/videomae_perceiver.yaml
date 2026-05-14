@@ -1,0 +1,26 @@
+# @package _global_
+# VideoMAE-pretrained tubelet ViT-S/16 + Perceiver head over the FULL space-time
+# token grid (T'·H'·W' = 392 tokens) + linear classifier.
+# Stage 2c — closes the spatial-discard hole in 2a/2b which saw only (B, T'=2, D).
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: videomae_vit
+    variant: vit_s_16
+    image_size: 224
+    num_frames: 4
+    tubelet_time: 2
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/videomae_stage1.pt
+    drop_path: 0.2
+    return_all_tokens: true        # exposes (B, T'=2, H'·W'=196, D=384)
+  temporal:
+    name: perceiver
+    num_queries: 16
+    num_heads: 6
+    num_layers: 3
+    mlp_ratio: 4.0
+    dropout: 0.1
+    max_frames: 2                  # T' = num_frames / tubelet_time = 2
+  classifier:
+    name: linear

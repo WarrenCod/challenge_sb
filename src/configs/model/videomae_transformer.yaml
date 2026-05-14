@@ -1,0 +1,23 @@
+# @package _global_
+# VideoMAE-pretrained tubelet ViT-S/16 + 2-layer temporal transformer + linear classifier.
+# Stage 2 v2: spatial-mean per tubelet → transformer mixes the T'=2 temporal tokens.
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: videomae_vit
+    variant: vit_s_16
+    image_size: 224
+    num_frames: 4
+    tubelet_time: 2
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/videomae_stage1.pt
+    drop_path: 0.1
+  temporal:
+    name: transformer
+    num_heads: 6
+    num_layers: 2
+    dim_feedforward: 1536    # 4 * embed_dim
+    dropout: 0.1
+    max_len: 8               # >= T'=2; cheap to leave headroom
+  classifier:
+    name: linear

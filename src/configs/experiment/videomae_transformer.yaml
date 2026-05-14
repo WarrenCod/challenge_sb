@@ -1,0 +1,54 @@
+# @package _global_
+# Stage 2 v2 — VideoMAE encoder + 2-layer temporal transformer.
+# Entry point: `python src/train.py experiment=videomae_transformer`
+# Same recipe as videomae_meanpool; only the head differs.
+defaults:
+  - override /model: videomae_transformer
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 32
+  lr: 1.5e-4                  # paper-scaled (see videomae_meanpool.yaml for rationale)
+  llrd: 0.75
+  epochs: 100
+  warmup_epochs: 5
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+
+  aug_strength: videomae      # clip-consistent RRC + CJ only; no RA, no RE, no flips.
+  mixup_alpha: 0.1
+  cutmix_alpha: 0.0
+
+  freeze_backbone_epochs: 5
+
+  ema: true
+  ema_decay: 0.999
+  distill_alpha: 0.5
+  distill_temperature: 2.0
+  eval_on_ema: false
+
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/videomae_transformer.pt
+  device: cuda
+  resume: true
+
+wandb:
+  enabled: true
+  run_name: videomae_transformer_v1
+  run_id: videomae_transformer_v1
+  tags: [track1, stage2, videomae, transformer, lpft, distill]
+  notes: |
+    Stage 2 v2 — VideoMAE encoder + 2-layer temporal transformer over T'=2 tokens.
+    Mirrors `videomae_meanpool` recipe; only the temporal head differs.
+
+    Sketch:
+      Clip(B,4,3,224,224) ──► VideoMAE encoder ──► (B, T'=2, D=384)
+                                                          │
+                              Temporal Transformer (2 layers, 6 heads) + learnable CLS
+                                                          │
+                                                Linear ──► logits(B, 33)

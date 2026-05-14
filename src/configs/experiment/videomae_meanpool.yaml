@@ -1,0 +1,60 @@
+# @package _global_
+# Stage 2 v1 — VideoMAE encoder + mean-pool head. Canonical VideoMAE fine-tune.
+# Entry point: `python src/train.py experiment=videomae_meanpool`
+defaults:
+  - override /model: videomae_meanpool
+
+dataset:
+  num_frames: 4               # hard cap
+
+training:
+  batch_size: 32
+  # Paper-scaled fine-tune LR: VideoMAE uses 1e-3 head + LLRD 0.75 at eff batch 1024;
+  # scaling linearly to our eff batch 32 gives ~3e-5. We pick 1.5e-4 — between paper
+  # and the original (too-hot) 5e-4 — to keep convergence fast while avoiding the
+  # cold-unfreeze shock that 5e-4 inflicts at epoch 5 of LP-FT.
+  lr: 1.5e-4
+  llrd: 0.75                  # was 0.70 — slightly gentler decay so mid-blocks aren't starved
+  epochs: 100
+  warmup_epochs: 5
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+
+  aug_strength: videomae      # clip-consistent RRC + CJ only; no RA, no RE, no flips — SSv2-safe.
+  mixup_alpha: 0.1
+  cutmix_alpha: 0.0           # CutMix breaks SSv2 motion direction.
+
+  freeze_backbone_epochs: 5   # LP-FT: head warms up before encoder unlocks.
+
+  ema: true
+  ema_decay: 0.999
+  distill_alpha: 0.5
+  distill_temperature: 2.0
+  eval_on_ema: false          # report live-student val (comparable to prior leaderboards)
+
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/videomae_meanpool.pt
+  device: cuda
+  resume: true
+
+wandb:
+  enabled: true
+  run_name: videomae_meanpool_v1
+  run_id: videomae_meanpool_v1
+  tags: [track1, stage2, videomae, meanpool, lpft, distill]
+  notes: |
+    Stage 2 v1 — VideoMAE encoder + spatial-mean (in trunk) + temporal-mean (head)
+    = canonical full GAP over (T'*H'*W') space-time tokens. 100 ep, batch 32, bf16.
+    LP-FT 5 ep + LLRD 0.70 + EMA self-distill (α=0.5, T=2, decay 0.999).
+
+    Sketch:
+      Clip(B,4,3,224,224) ──► VideoMAE encoder ──► (B, T'=2, D=384)
+                                                          │
+                                                  Mean over T' ──► (B, D)
+                                                          │
+                                                Linear ──► logits(B, 33)
+
+    Loss = (1-α)·CE(label, label_smooth=0.1) + α·KL(student || EMA(student) / T)

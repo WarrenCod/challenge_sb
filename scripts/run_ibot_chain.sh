@@ -17,6 +17,12 @@ PY="${PY:-/Data/challenge_sb/.venv/bin/python}"
 # Fragmentation safety on A5000 — keeps multi-crop memory predictable.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+# Why: 2026-05-10 wandb network blip stalled the training loop in
+# `Network error, entering retry loop` until the python process died.
+# Offline mode writes to wandb/offline-run-* and never touches the network
+# during training — sync afterwards with `wandb sync wandb/offline-run-*`.
+export WANDB_MODE="${WANDB_MODE:-offline}"
+
 STAGE1_CKPT="checkpoints/ibot_stage1.pt"
 STAGE2_CKPT="checkpoints/ibot_transf_4.pt"
 SUBMISSION_CSV="submissions/ibot_transf_4.csv"

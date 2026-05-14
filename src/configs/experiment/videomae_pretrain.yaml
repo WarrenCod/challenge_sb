@@ -1,0 +1,75 @@
+# @package _global_
+# Stage 1 — VideoMAE self-supervised pretraining on the unlabeled train+val+test pool.
+# Entry point: `python src/pretrain_videomae.py experiment=videomae_pretrain`
+#
+# Architecture: tubelet ViT-S/16 (Conv3d k=2x16x16) + 4-block decoder.
+#   Token grid at 224^2, 4 frames, tubelet_time=2:  (T'=2, H'=14, W'=14) = 392 tokens.
+#   Tube masking @ 0.90 → 39 visible tubelets through the encoder.
+#   Loss: per-tubelet normalized-pixel MSE on masked positions only.
+
+dataset:
+  pretrain_dirs:
+    - ${hydra:runtime.cwd}/processed_data/train
+    - ${hydra:runtime.cwd}/processed_data/val
+    - ${hydra:runtime.cwd}/processed_data/test
+
+videomae:
+  num_frames: 4
+  image_size: 224
+  tubelet_time: 2          # 4 input frames -> 2 temporal tubelets (each spans 2 frames)
+  tubelet_size: 16
+  embed_dim: 384           # ViT-S
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  decoder_embed_dim: 192
+  decoder_depth: 4
+  decoder_num_heads: 6
+  mask_ratio: 0.90         # VideoMAE-on-SSv2 optimum; fallback 0.75 if probe stalls
+  norm_pix_loss: true
+  # Clip-consistent aug (no flips, no RandAug/RandomErasing — VideoMAE relies on masking).
+  rrc_scale: [0.5, 1.0]
+  rrc_ratio: [0.75, 1.3333]
+  brightness: 0.4
+  contrast: 0.4
+  saturation: 0.4
+
+training:
+  batch_size: 32           # A5000 24 GiB; effective batch = 32 * grad_accum
+  grad_accum: 8            # effective 256 → matches the LR-scaling base
+  base_lr: 1.5e-4          # actual lr = base_lr * effective_batch / 256
+  weight_decay: 0.05
+  warmup_epochs: 40
+  epochs: 800
+  amp: true                # bf16 (no GradScaler)
+  num_workers: 8
+  grad_clip: 1.0
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/videomae_stage1.pt
+  snapshot_every: 25
+  device: cuda
+  resume: true
+
+wandb:
+  enabled: true
+  run_name: videomae_pretrain_v1
+  run_id: videomae_pretrain_v1
+  tags: [track1, stage1, videomae, pretraining]
+  notes: |
+    Stage 1 v1 — VideoMAE on train+val+test clip pool (~58K clips, 4 frames each).
+    No flips. ViT-S/16, tubelet (2,16,16), tube-mask 0.90, 800 ep, eff batch 256, bf16.
+    Output: checkpoints/videomae_stage1.pt (encoder_state_dict for Stage 2).
+
+    Sketch:
+      Clip(B,4,3,224,224) ──► permute (B,3,4,224,224) ──► Conv3d (2x16x16) ──► (B, 392, 384)
+                                                                  │
+                                                          + 3-D sin-cos pos-embed
+                                                                  │
+                                          Tube-mask 90% spatial (shared across t-slots)
+                                                                  │
+                                                  ViT-S/16 encoder (visible only, 39 tokens)
+                                                                  │
+                                          Decoder ViT 4-layer / 192d (all 392 positions)
+                                                                  │
+                                          Linear → per-tubelet 2·16·16·3 = 1536 channels
+
+    Loss = MSE(masked positions, norm_pix=True).

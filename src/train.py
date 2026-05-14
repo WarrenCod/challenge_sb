@@ -29,19 +29,24 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from dataset.multi_clip_dataset import MultiClipVideoDataset
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
+from models.aux.pair_direction import PairDirectionAuxHead
 from models.cmt import CMT
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.modular import build_modular_model
+from torch.optim.swa_utils import AveragedModel
 from utils import (
     ModelEMA,
+    apply_mix_shared,
     atomic_torch_save,
     build_llrd_param_groups,
     build_soft_clip_transform,
     build_strong_clip_transform,
     build_transforms,
     build_two_group_param_groups,
+    build_videomae_clip_transform,
     capture_rng_state,
     cutmix_batch,
     finish_wandb,
@@ -49,6 +54,7 @@ from utils import (
     make_resume_hash,
     mixup_batch,
     restore_rng_state,
+    sample_mix_params,
     set_backbone_frozen,
     set_seed,
     split_train_val,
@@ -108,6 +114,9 @@ def train_one_epoch(
     teacher: Optional[ModelEMA] = None,
     distill_alpha: float = 0.0,
     distill_temperature: float = 1.0,
+    pair_direction_head: Optional[PairDirectionAuxHead] = None,
+    pair_direction_weight: float = 0.0,
+    multi_clip_consistency_weight: float = 0.0,
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the training set for one epoch.
 
@@ -124,47 +133,117 @@ def train_one_epoch(
     total = 0
 
     bar = tqdm(data_loader, desc=f"{epoch_label} train", leave=False, dynamic_ncols=True)
-    for video_batch, labels in bar:
-        # video_batch: (B, T, C, H, W), labels: (B,)
-        video_batch = video_batch.to(device, non_blocking=True)
+    multi_clip_active = multi_clip_consistency_weight > 0.0
+    aux_active = pair_direction_head is not None and pair_direction_weight > 0.0
+    for batch in bar:
+        # batch is (video, label) or (clip_a, clip_b, label) when multi-clip is on.
+        if multi_clip_active and len(batch) == 3:
+            clip_a, clip_b, labels = batch
+            clip_a = clip_a.to(device, non_blocking=True)
+            clip_b = clip_b.to(device, non_blocking=True)
+        else:
+            clip_a, labels = batch
+            clip_a = clip_a.to(device, non_blocking=True)
+            clip_b = None
         labels = labels.to(device, non_blocking=True)
 
-        # Alternate Mixup / CutMix per batch when both are enabled.
-        if mixup_alpha > 0 and cutmix_alpha > 0:
-            if random.random() < 0.5:
-                video_batch, (y_a, y_b, lam) = mixup_batch(video_batch, labels, mixup_alpha)
+        # Sample mix params ONCE so both halves are mixed identically.
+        h, w = clip_a.shape[-2], clip_a.shape[-1]
+        if clip_b is not None:
+            mix = sample_mix_params(clip_a.size(0), mixup_alpha, cutmix_alpha, h, w, device)
+            clip_a = apply_mix_shared(clip_a, mix)
+            clip_b = apply_mix_shared(clip_b, mix)
+            if mix["kind"] == "none":
+                y_a, y_b, lam = labels, labels, 1.0
             else:
-                video_batch, (y_a, y_b, lam) = cutmix_batch(video_batch, labels, cutmix_alpha)
-        elif mixup_alpha > 0:
-            video_batch, (y_a, y_b, lam) = mixup_batch(video_batch, labels, mixup_alpha)
-        elif cutmix_alpha > 0:
-            video_batch, (y_a, y_b, lam) = cutmix_batch(video_batch, labels, cutmix_alpha)
+                y_a, y_b, lam = labels, labels[mix["perm"]], float(mix["lam"])
+            video_batch = clip_a
         else:
-            y_a, y_b, lam = labels, labels, 1.0
+            # Single-clip path (legacy).
+            if mixup_alpha > 0 and cutmix_alpha > 0:
+                if random.random() < 0.5:
+                    clip_a, (y_a, y_b, lam) = mixup_batch(clip_a, labels, mixup_alpha)
+                else:
+                    clip_a, (y_a, y_b, lam) = cutmix_batch(clip_a, labels, cutmix_alpha)
+            elif mixup_alpha > 0:
+                clip_a, (y_a, y_b, lam) = mixup_batch(clip_a, labels, mixup_alpha)
+            elif cutmix_alpha > 0:
+                clip_a, (y_a, y_b, lam) = cutmix_batch(clip_a, labels, cutmix_alpha)
+            else:
+                y_a, y_b, lam = labels, labels, 1.0
+            video_batch = clip_a
 
         optimizer.zero_grad(set_to_none=True)
 
         kd_active = teacher is not None and distill_alpha > 0.0
         T = float(distill_temperature)
 
-        def _compose_loss(logits_: torch.Tensor) -> torch.Tensor:
-            ce = lam * loss_fn(logits_, y_a) + (1.0 - lam) * loss_fn(logits_, y_b)
-            if not kd_active:
-                return ce
-            with torch.no_grad():
-                teacher_logits = teacher.module(video_batch)
-            kd = F.kl_div(
-                F.log_softmax(logits_ / T, dim=-1),
-                F.softmax(teacher_logits.float() / T, dim=-1),
-                reduction="batchmean",
-            ) * (T * T)
-            return (1.0 - distill_alpha) * ce + distill_alpha * kd
+        def _forward(video):
+            """Single forward.
+
+            Returns ``(logits, frame_cls or None)``. When the aux head is
+            active and the spatial encoder returns 4-D ``(B, T', N, D)``
+            features, we unpack the model so the per-tubelet mean is exposed
+            to the aux head. Otherwise just call ``model(video)``.
+            """
+            if not aux_active:
+                return model(video), None
+            features = model.spatial(video)
+            if features.dim() == 4:
+                frame_cls = features.mean(dim=2)         # (B, T', D)
+            else:
+                frame_cls = features                     # already (B, T', D)
+            temporal_out = model.temporal(features)
+            logits_ = model.classifier(temporal_out)
+            return logits_, frame_cls
+
+        def _compose_loss(logits_: torch.Tensor, frame_cls_a, logits_b=None, frame_cls_b=None):
+            ce_a = lam * loss_fn(logits_, y_a) + (1.0 - lam) * loss_fn(logits_, y_b)
+            total = ce_a
+            if logits_b is not None:
+                # Secondary clip CE (same labels under shared mix).
+                ce_b = lam * loss_fn(logits_b, y_a) + (1.0 - lam) * loss_fn(logits_b, y_b)
+                total = 0.5 * (ce_a + ce_b)
+                # Symmetric KL consistency. Detach the target side so each KL
+                # term pulls one set of logits toward a soft moving target.
+                p_a = F.log_softmax(logits_, dim=-1)
+                p_b = F.log_softmax(logits_b, dim=-1)
+                with torch.no_grad():
+                    q_a = F.softmax(logits_.detach().float(), dim=-1)
+                    q_b = F.softmax(logits_b.detach().float(), dim=-1)
+                kl_ab = F.kl_div(p_a, q_b, reduction="batchmean")
+                kl_ba = F.kl_div(p_b, q_a, reduction="batchmean")
+                total = total + multi_clip_consistency_weight * 0.5 * (kl_ab + kl_ba)
+            if aux_active and frame_cls_a is not None:
+                aux_loss = pair_direction_head(frame_cls_a, y_a, y_b, lam, loss_fn)
+                if frame_cls_b is not None:
+                    aux_loss_b = pair_direction_head(frame_cls_b, y_a, y_b, lam, loss_fn)
+                    aux_loss = 0.5 * (aux_loss + aux_loss_b)
+                total = total + pair_direction_weight * aux_loss
+            if kd_active:
+                with torch.no_grad():
+                    teacher_logits = teacher.module(video_batch)
+                kd = F.kl_div(
+                    F.log_softmax(logits_ / T, dim=-1),
+                    F.softmax(teacher_logits.float() / T, dim=-1),
+                    reduction="batchmean",
+                ) * (T * T)
+                total = (1.0 - distill_alpha) * total + distill_alpha * kd
+            return total
+
+        def _full_forward():
+            logits_a, fcls_a = _forward(clip_a)
+            if clip_b is not None:
+                logits_b, fcls_b = _forward(clip_b)
+            else:
+                logits_b, fcls_b = None, None
+            return logits_a, fcls_a, logits_b, fcls_b
 
         stepped = True
         if amp and scaler is not None:
             with autocast(device_type=device.type, dtype=amp_dtype):
-                logits = model(video_batch)
-                loss = _compose_loss(logits)
+                logits, fcls_a, logits_b, fcls_b = _full_forward()
+                loss = _compose_loss(logits, fcls_a, logits_b, fcls_b)
             scaler.scale(loss).backward()
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -172,20 +251,18 @@ def train_one_epoch(
             prev_scale = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            # Scaler lowers the scale when it skipped the step due to inf/NaN grads.
             stepped = scaler.get_scale() >= prev_scale
         elif amp:
-            # bf16 path: no grad scaler needed.
             with autocast(device_type=device.type, dtype=amp_dtype):
-                logits = model(video_batch)
-                loss = _compose_loss(logits)
+                logits, fcls_a, logits_b, fcls_b = _full_forward()
+                loss = _compose_loss(logits, fcls_a, logits_b, fcls_b)
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         else:
-            logits = model(video_batch)
-            loss = _compose_loss(logits)
+            logits, fcls_a, logits_b, fcls_b = _full_forward()
+            loss = _compose_loss(logits, fcls_a, logits_b, fcls_b)
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -303,11 +380,29 @@ def main(cfg: DictConfig) -> None:
     aug_strength = str(cfg.training.get("aug_strength", "")).lower()
     use_strong_aug = bool(cfg.training.get("strong_clip_aug", False)) or aug_strength == "strong"
     use_soft_aug = aug_strength == "soft"
-    if use_soft_aug:
+    use_videomae_aug = aug_strength == "videomae"
+    # Multi-clip wraps VideoFrameDataset to yield (clip_a, clip_b, label) so the
+    # train loop can compute a sym-KL consistency loss between two augmented views.
+    multi_clip_cfg = cfg.training.get("multi_clip", None)
+    multi_clip_enabled = bool(multi_clip_cfg is not None and multi_clip_cfg.get("enabled", False))
+    TrainDatasetCls = MultiClipVideoDataset if multi_clip_enabled else VideoFrameDataset
+    if multi_clip_enabled:
+        print(f"[train] multi-clip enabled (num_clips=2, consistency_weight={float(multi_clip_cfg.get('consistency_weight', 0.2))})")
+    if use_videomae_aug:
+        train_clip_transform = build_videomae_clip_transform(
+            image_size=224, use_imagenet_norm=use_imagenet_norm
+        )
+        train_dataset = TrainDatasetCls(
+            root_dir=train_dir,
+            num_frames=int(cfg.dataset.num_frames),
+            clip_transform=train_clip_transform,
+            sample_list=train_samples,
+        )
+    elif use_soft_aug:
         train_clip_transform = build_soft_clip_transform(
             image_size=224, use_imagenet_norm=use_imagenet_norm
         )
-        train_dataset = VideoFrameDataset(
+        train_dataset = TrainDatasetCls(
             root_dir=train_dir,
             num_frames=int(cfg.dataset.num_frames),
             clip_transform=train_clip_transform,
@@ -317,14 +412,14 @@ def main(cfg: DictConfig) -> None:
         train_clip_transform = build_strong_clip_transform(
             image_size=224, use_imagenet_norm=use_imagenet_norm
         )
-        train_dataset = VideoFrameDataset(
+        train_dataset = TrainDatasetCls(
             root_dir=train_dir,
             num_frames=int(cfg.dataset.num_frames),
             clip_transform=train_clip_transform,
             sample_list=train_samples,
         )
     else:
-        train_dataset = VideoFrameDataset(
+        train_dataset = TrainDatasetCls(
             root_dir=train_dir,
             num_frames=int(cfg.dataset.num_frames),
             transform=train_transform,
@@ -353,6 +448,34 @@ def main(cfg: DictConfig) -> None:
     )
 
     model = build_model(cfg).to(device)
+
+    # Optional auxiliary head: pair-direction CE over per-tubelet summary tokens.
+    # When enabled, the head is attached as a submodule of the model so it is
+    # saved/loaded via the model state_dict and picked up by the optimizer
+    # param-group walker (LLRD puts it in the head groups by exclusion).
+    pair_cfg = cfg.training.get("pair_direction", None)
+    pair_direction_head: Optional[PairDirectionAuxHead] = None
+    pair_direction_weight = 0.0
+    if pair_cfg is not None and bool(pair_cfg.get("enabled", False)):
+        if not hasattr(model, "spatial"):
+            raise ValueError("pair_direction requires model.name=modular (model.spatial.out_dim)")
+        pair_num_frames = int(pair_cfg.get(
+            "num_frames",
+            getattr(getattr(model.spatial, "encoder", None), "t_grid", cfg.dataset.num_frames),
+        ))
+        pair_direction_head = PairDirectionAuxHead(
+            embed_dim=int(model.spatial.out_dim),
+            num_frames=pair_num_frames,
+            num_classes=int(cfg.model.num_classes),
+            hidden_dim=int(pair_cfg.get("hidden_dim", 768)),
+        ).to(device)
+        pair_direction_weight = float(pair_cfg.get("weight", 0.3))
+        model.pair_direction_head = pair_direction_head
+        print(
+            f"[train] PairDirectionAux: T={pair_num_frames}, "
+            f"weight={pair_direction_weight}, hidden={pair_direction_head.fc1.out_features}"
+        )
+
     label_smoothing = float(cfg.training.get("label_smoothing", 0.0))
     loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
@@ -432,6 +555,17 @@ def main(cfg: DictConfig) -> None:
         ema = ModelEMA(model, decay=ema_decay)
         print(f"[train] EMA enabled (decay={ema_decay})")
 
+    # Optional SWA — averages weights over the plateau window for a final
+    # consolidation step. AveragedModel handles the averaging math; we save the
+    # averaged weights separately at end-of-training as `<run>_swa.pt`.
+    swa_cfg = cfg.training.get("swa", None)
+    swa: Optional[AveragedModel] = None
+    swa_start_epoch = -1
+    if swa_cfg is not None and bool(swa_cfg.get("enabled", False)):
+        swa = AveragedModel(model)
+        swa_start_epoch = int(swa_cfg.get("start_epoch", max(1, int(cfg.training.epochs) // 2)))
+        print(f"[train] SWA enabled (start_epoch={swa_start_epoch})")
+
     best_val_accuracy = 0.0
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
     last_path = checkpoint_path.with_name(checkpoint_path.stem + "_last" + checkpoint_path.suffix)
@@ -459,6 +593,13 @@ def main(cfg: DictConfig) -> None:
             scaler.load_state_dict(state["scaler"])
         if ema is not None and state.get("ema") is not None:
             ema.module.load_state_dict(state["ema"])
+        if swa is not None and state.get("swa") is not None:
+            try:
+                swa.module.load_state_dict(state["swa"]["module"])
+                swa.n_averaged.fill_(int(state["swa"]["n_averaged"]))
+                print(f"[train] resumed SWA (n_averaged={int(swa.n_averaged.item())})")
+            except Exception as e:
+                print(f"[train] WARNING: SWA resume failed ({e}); starting fresh SWA")
         start_epoch = int(state["epoch"])
         best_val_accuracy = float(state.get("best_val_accuracy", 0.0))
         if "rng" in state:
@@ -472,6 +613,9 @@ def main(cfg: DictConfig) -> None:
     freeze_backbone_epochs = int(cfg.training.get("freeze_backbone_epochs", 0))
     distill_alpha = float(cfg.training.get("distill_alpha", 0.0))
     distill_temperature = float(cfg.training.get("distill_temperature", 1.0))
+    multi_clip_consistency_weight = float(
+        (multi_clip_cfg or {}).get("consistency_weight", 0.0)
+    ) if multi_clip_enabled else 0.0
     # When EMA is used as a distillation teacher, evaluating on it would just
     # measure the teacher — eval the live student instead. The flag still lets
     # legacy configs keep eval-on-EMA when no distillation is active.
@@ -508,7 +652,14 @@ def main(cfg: DictConfig) -> None:
             teacher=ema if distill_alpha > 0.0 else None,
             distill_alpha=distill_alpha,
             distill_temperature=distill_temperature,
+            pair_direction_head=pair_direction_head,
+            pair_direction_weight=pair_direction_weight,
+            multi_clip_consistency_weight=multi_clip_consistency_weight,
         )
+
+        # SWA update: add this epoch's weights to the running average.
+        if swa is not None and (epoch + 1) >= swa_start_epoch:
+            swa.update_parameters(model)
         eval_model = ema.module if (ema is not None and eval_on_ema) else model
         val_loss, val_acc = evaluate_epoch(
             eval_model,
@@ -562,24 +713,44 @@ def main(cfg: DictConfig) -> None:
             )
 
         # Per-epoch resumable snapshot (full state, atomic, overwritten).
-        atomic_torch_save(
-            {
-                "model": model.state_dict(),
-                "ema": ema.module.state_dict() if ema is not None else None,
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "scaler": scaler.state_dict() if scaler is not None else None,
-                "epoch": epoch + 1,
-                "cfg_hash": cfg_hash,
-                "config": OmegaConf.to_container(cfg, resolve=True),
-                "rng": capture_rng_state(),
-                "best_val_accuracy": best_val_accuracy,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-            },
-            last_path,
-        )
+        snapshot = {
+            "model": model.state_dict(),
+            "ema": ema.module.state_dict() if ema is not None else None,
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict() if scaler is not None else None,
+            "epoch": epoch + 1,
+            "cfg_hash": cfg_hash,
+            "config": OmegaConf.to_container(cfg, resolve=True),
+            "rng": capture_rng_state(),
+            "best_val_accuracy": best_val_accuracy,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+        }
+        if swa is not None:
+            snapshot["swa"] = {
+                "module": swa.module.state_dict(),
+                "n_averaged": int(swa.n_averaged.item()),
+            }
+        atomic_torch_save(snapshot, last_path)
+
+    # End-of-training: write the SWA-averaged weights to a separate
+    # checkpoint so submission scripts can load them in place of the live
+    # student. We save it under a "*_swa.pt" sibling of the best checkpoint.
+    if swa is not None and int(swa.n_averaged.item()) > 0:
+        swa_path = checkpoint_path.with_name(checkpoint_path.stem + "_swa" + checkpoint_path.suffix)
+        swa_payload: Dict[str, Any] = {
+            "model_state_dict": swa.module.state_dict(),
+            "model_name": cfg.model.name,
+            "num_classes": int(cfg.model.num_classes),
+            "pretrained": use_imagenet_norm,
+            "num_frames": int(cfg.dataset.num_frames),
+            "n_averaged": int(swa.n_averaged.item()),
+            "config": OmegaConf.to_container(cfg, resolve=True),
+        }
+        atomic_torch_save(swa_payload, swa_path)
+        print(f"  Saved SWA model to {swa_path} (n_averaged={int(swa.n_averaged.item())})")
 
     print(f"Done. Best validation accuracy: {best_val_accuracy:.4f}")
     wandb_log({"val/best_acc": best_val_accuracy})

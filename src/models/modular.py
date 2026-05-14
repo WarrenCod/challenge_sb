@@ -30,10 +30,12 @@ from models.spatial.resnet import ResNetEncoder
 from models.spatial.resnet_tsm import ResNetTSMEncoder
 from models.spatial.vit import ViTEncoder
 from models.spatial.vit_mae import ViTMAEEncoder
+from models.spatial.videomae_vit import VideoMAESpatial
 from models.temporal.diff_transformer import DiffTransformerTemporal
 from models.temporal.dual_stream_transformer import DualStreamTransformerTemporal
 from models.temporal.lstm import LSTMTemporal
 from models.temporal.mean_pool import MeanPoolTemporal
+from models.temporal.perceiver import PerceiverHead
 from models.temporal.transformer import TransformerTemporal
 
 try:
@@ -49,6 +51,7 @@ SPATIAL_REGISTRY: Dict[str, type] = {
     "resnet_tsm": ResNetTSMEncoder,
     "vit": ViTEncoder,
     "vit_mae": ViTMAEEncoder,
+    "videomae_vit": VideoMAESpatial,
 }
 TEMPORAL_REGISTRY: Dict[str, type] = {
     "mean_pool": MeanPoolTemporal,
@@ -56,6 +59,7 @@ TEMPORAL_REGISTRY: Dict[str, type] = {
     "transformer": TransformerTemporal,
     "diff_transformer": DiffTransformerTemporal,
     "dual_stream_transformer": DualStreamTransformerTemporal,
+    "perceiver": PerceiverHead,
 }
 CLASSIFIER_REGISTRY: Dict[str, type] = {
     "linear": LinearClassifier,

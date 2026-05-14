@@ -371,6 +371,28 @@ def build_soft_clip_transform(image_size: int = 224, use_imagenet_norm: bool = T
     )
 
 
+def build_videomae_clip_transform(image_size: int = 224, use_imagenet_norm: bool = False) -> ConsistentClipAug:
+    """Clip-consistent RRC + ColorJitter only. No RandAugment, no RandomErasing,
+    no flips — RandAugment's per-frame internal RNG can shift pixel positions
+    between frames, and that scrambles direction-sensitive SSv2 cues. This
+    mirrors `_ClipConsistentTransform` in pretrain_videomae.py so Stage 2 sees
+    the same aug distribution as Stage 1.
+    """
+    return ConsistentClipAug(
+        image_size=image_size,
+        scale=(0.5, 1.0),
+        ratio=(3 / 4, 4 / 3),
+        brightness=0.4,
+        contrast=0.4,
+        saturation=0.4,
+        hue=0.0,
+        randaug_n=0,
+        randaug_m=0,
+        erase_p=0.0,
+        use_imagenet_norm=use_imagenet_norm,
+    )
+
+
 def set_backbone_frozen(model: nn.Module, frozen: bool) -> None:
     """Freeze / unfreeze the spatial trunk of a ModularVideoModel for LP-FT."""
     if not hasattr(model, "spatial"):
@@ -421,6 +443,79 @@ def cutmix_batch(x: torch.Tensor, y: torch.Tensor, alpha: float):
     x_mixed[:, :, :, y1:y2, x1:x2] = x[perm][:, :, :, y1:y2, x1:x2]
     lam_adj = 1.0 - ((y2 - y1) * (x2 - x1)) / float(h * w)
     return x_mixed, (y, y[perm], lam_adj)
+
+
+def sample_mix_params(
+    batch_size: int,
+    mixup_alpha: float,
+    cutmix_alpha: float,
+    h: int,
+    w: int,
+    device: torch.device,
+):
+    """Decide which mix to apply and sample its parameters ONCE.
+
+    Used to apply the **same** mixing to two clips of the same video in
+    multi-clip training (the pairing must stay intact for the consistency
+    loss to be meaningful).
+
+    Returns a dict with keys ``{"kind": "none"|"mixup"|"cutmix", "perm": Tensor,
+    "lam": float, "y1": int, "y2": int, "x1": int, "x2": int}`` (rectangle keys
+    are only present for cutmix). Caller routes through ``apply_mixup_shared``
+    or ``apply_cutmix_shared``.
+    """
+    has_mixup = mixup_alpha > 0
+    has_cutmix = cutmix_alpha > 0
+    if has_mixup and has_cutmix:
+        use_cutmix = random.random() >= 0.5
+    elif has_cutmix:
+        use_cutmix = True
+    elif has_mixup:
+        use_cutmix = False
+    else:
+        return {"kind": "none", "perm": torch.arange(batch_size, device=device), "lam": 1.0}
+
+    perm = torch.randperm(batch_size, device=device)
+    if use_cutmix:
+        lam = float(np.random.beta(cutmix_alpha, cutmix_alpha))
+        cut_ratio = math.sqrt(1.0 - lam)
+        cut_h = int(h * cut_ratio)
+        cut_w = int(w * cut_ratio)
+        if cut_h <= 0 or cut_w <= 0:
+            return {"kind": "none", "perm": perm, "lam": 1.0}
+        cy = np.random.randint(h)
+        cx = np.random.randint(w)
+        y1 = max(0, cy - cut_h // 2)
+        y2 = min(h, cy + cut_h // 2)
+        x1 = max(0, cx - cut_w // 2)
+        x2 = min(w, cx + cut_w // 2)
+        if y2 == y1 or x2 == x1:
+            return {"kind": "none", "perm": perm, "lam": 1.0}
+        lam_adj = 1.0 - ((y2 - y1) * (x2 - x1)) / float(h * w)
+        return {
+            "kind": "cutmix", "perm": perm, "lam": lam_adj,
+            "y1": y1, "y2": y2, "x1": x1, "x2": x2,
+        }
+    else:
+        lam = float(np.random.beta(mixup_alpha, mixup_alpha))
+        return {"kind": "mixup", "perm": perm, "lam": lam}
+
+
+def apply_mix_shared(x: torch.Tensor, params: dict) -> torch.Tensor:
+    """Apply the mix described by ``params`` to a clip batch ``(B, T, C, H, W)``."""
+    kind = params["kind"]
+    if kind == "none":
+        return x
+    perm = params["perm"]
+    if kind == "mixup":
+        lam = params["lam"]
+        return lam * x + (1.0 - lam) * x[perm]
+    if kind == "cutmix":
+        y1, y2, x1, x2 = params["y1"], params["y2"], params["x1"], params["x2"]
+        x_mixed = x.clone()
+        x_mixed[:, :, :, y1:y2, x1:x2] = x[perm][:, :, :, y1:y2, x1:x2]
+        return x_mixed
+    raise ValueError(f"unknown mix kind: {kind}")
 
 
 def build_two_group_param_groups(

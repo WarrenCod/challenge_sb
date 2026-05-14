@@ -1,0 +1,81 @@
+# @package _global_
+# Stage 2 exp3p — VideoMAE encoder + ST blocks + Perceiver + heavy reg +
+# multi-clip consistency + SWA. EMA-self-distill only (no external teacher).
+# Entry point: `python src/train.py experiment=videomae_exp3p`
+defaults:
+  - override /model: videomae_exp3p
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 16                   # 16 × 2 multi-clip halves = 32 clips per optimizer step
+  lr: 1.5e-4
+  llrd: 0.70                       # exp2n/3a value — slightly more aggressive on early layers
+  epochs: 70                       # peak earlier with heavy reg
+  warmup_epochs: 8
+  weight_decay: 0.05
+  label_smoothing: 0.15
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 0.5
+
+  aug_strength: videomae           # clip-consistent RRC + ColorJitter; no flips, no RA
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0                # clip-consistent rect → direction-safe (utils.cutmix_batch)
+
+  freeze_backbone_epochs: 8        # LP-FT: head + ST blocks burn in before trunk unfreezes
+
+  ema: true
+  ema_decay: 0.9999
+  distill_alpha: 0.3               # EMA-self distill only (no external teacher per user dir)
+  distill_temperature: 2.0
+  eval_on_ema: false
+
+  pair_direction:
+    enabled: true
+    weight: 0.3
+    hidden_dim: 512
+
+  multi_clip:
+    enabled: true
+    consistency_weight: 0.2
+    num_clips: 2
+
+  swa:
+    enabled: true
+    start_epoch: 35                # plateau window ep 35..70
+
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/videomae_exp3p.pt
+  device: cuda
+  resume: true
+
+wandb:
+  enabled: true
+  run_name: videomae_exp3p_v1
+  run_id: videomae_exp3p_v1
+  tags: [track1, stage2, videomae, perceiver, st_blocks, multi_clip, swa, exp3p]
+  notes: |
+    Stage 2 exp3p — VideoMAE-S/16 + K=4 ST blocks + Perceiver (4 SA layers,
+    sinusoidal+learnable_scale temporal pos) over full 392 space-time tokens.
+    Heavy reg (drop_path 0.0→0.30 sched, dropout 0.30, LS 0.15, LLRD 0.70,
+    cutmix 1.0). Multi-clip consistency (2 views, sym KL λ=0.2). Pair-direction
+    aux (1 pair, T'=2, λ=0.3). EMA-self-distill α=0.3 T=2 (no external teacher).
+    SWA over ep 35..70. 70 ep, batch 16 × 2 multi-clip halves.
+
+    Sketch:
+      Clip(B,4,3,224,224) ──► VideoMAE encoder + K=4 ST blocks ──► (B, 392, 384)
+                                                                       │
+                                                            reshape (B,T'=2,196,384)
+                                                                       │
+                                          Perceiver (Q=16, 4 SA layers, sinusoidal pos)
+                                                                       │
+                                                            Linear ──► logits(B, 33)
+      Aux:  PairDirection(1 pair) ─► CE
+      Aux:  Multi-clip sym KL between clip_a, clip_b predictions
+
+    Loss = CE_mix(0.15) + α·KL(EMA-self) + 0.3·CE_pair + 0.2·sym_KL(clip_a, clip_b)
+
+    After training: optional pseudo-label fine-tune via
+    `python src/pseudo_label_finetune.py training.checkpoint_path=<best.pt>`

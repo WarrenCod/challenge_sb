@@ -1,0 +1,19 @@
+# @package _global_
+# VideoMAE-pretrained tubelet ViT-S/16 + mean-pool temporal head + linear classifier.
+# Stage 2 v1 (canonical VideoMAE fine-tune: GAP over space-time tokens via
+# spatial-mean-in-trunk + temporal-mean-in-head).
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: videomae_vit
+    variant: vit_s_16
+    image_size: 224
+    num_frames: 4
+    tubelet_time: 2
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/videomae_stage1.pt
+    drop_path: 0.1
+  temporal:
+    name: mean_pool
+  classifier:
+    name: linear
