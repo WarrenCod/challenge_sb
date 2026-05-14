@@ -1,0 +1,90 @@
+# @package _global_
+# exp3a (Track 1): Stage-2 v3 aiming at +5–8 pp over exp2n (0.4746 real val).
+# Four orthogonal levers on top of the exp2n recipe:
+#   1. K=4 → K=6 divided ST blocks in the ViT-S backbone.
+#   2. Perceiver: sinusoidal+learnable_scale temporal pos, 3 → 4 self-attn
+#      layers. Order-aware from step 0.
+#   3. Pair-direction aux head: 6 ordered (i<j) frame pairs → 33-class CE,
+#      weight 0.3. Replaces exp2n's predict-next/prev CLS (cosine-distance).
+#   4. Multi-clip consistency: two augmented views per video, symmetric KL
+#      between their predictions (weight 0.2). Mixup/cutmix applied with
+#      SHARED (lam, perm) across halves so the pairing stays intact.
+# Distillation: ensemble teacher (exp2m + exp2n_bare), α=0.5, T=4.
+# SWA: dropped (wash on exp2n).
+defaults:
+  - override /model: vit_mae_st_perceiver
+
+model:
+  spatial:
+    drop_path: 0.30
+    drop_path_schedule: linear   # 0.0 (block 0) → 0.30 (block 11), per-block
+    space_time_layers: 6         # exp2n used K=4; broaden temporal coverage
+  temporal:
+    num_layers: 4                # exp2n used 3
+    dropout: 0.30
+    temporal_pos_init: sinusoidal_fixed_with_scale
+
+dataset:
+  num_frames: 4
+  seed: 1337
+  random_temporal_offset: true   # required by multi_clip
+
+training:
+  batch_size: 8                  # 8 videos × 2 clips = 16 clips per optimizer step
+  lr: 1.5e-4
+  llrd: 0.70
+  epochs: 55                     # exp2n peaked at ep 41; tighter budget
+  warmup_epochs: 8
+  weight_decay: 0.05
+  label_smoothing: 0.15
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 0.5
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp3a_vivit_pairwise_multiclip.pt
+  device: cuda
+  distill:
+    teacher_ckpt:
+      - ${hydra:runtime.cwd}/checkpoints/exp2m_st_perceiver.pt
+      - ${hydra:runtime.cwd}/checkpoints/exp2n_bornagain_bidir_swa.pt
+    combine: softmax_mean
+    alpha: 0.5
+    temperature: 4.0
+  pair_direction:
+    enabled: true
+    weight: 0.3
+    hidden_dim: 768
+  multi_clip:
+    enabled: true
+    consistency_weight: 0.2
+    num_clips: 2
+
+submission:
+  tta_clips: 5
+
+wandb:
+  enabled: true
+  run_name: exp3a_vivit_pairwise_multiclip
+  run_id: exp3a_vivit_pairwise_multiclip
+  tags:
+    [
+      track1,
+      stage2,
+      mae,
+      perceiver,
+      timesformer,
+      spacetime,
+      distill,
+      bornagain,
+      ensemble_teacher,
+      ema,
+      cutmix,
+      pair_direction,
+      multi_clip,
+      consistency_kl,
+      real_val,
+    ]

@@ -188,3 +188,12 @@ D3. **Epoch budget.** 70 ep (default — fits exp2m's curve) vs 80 ep (more
     buffer if SWA shifts the peak right).
 D4. **5-crop TTA.** Adds ~5× submission cost (still trivial on the A5000).
     Keep at submission-time only? Default: yes.
+
+## Run log
+
+- **2026-05-10 23:27** — launched (W&B `d6c7x5rz`). Reached epoch 50/70 cleanly. SWA averaging began at ep 35 (configured).
+- **2026-05-11 06:33** — process killed externally (no traceback, no OOM, no host reboot). `_last.pt` saved at end of ep 50 (06:31). In-memory SWA averager lost — never flushed to `_swa.pt`.
+- **Mid-train real val** (best ckpt at kill time): **top-1 0.4746**, top-5 0.7881. Compare to **exp2m: 0.4689 / 0.7804**. exp2n leads by +0.57 pp top-1.
+- In-train val/acc (0.4750) vs real val (0.4746): essentially zero gap on this setup — contradicts the prior +20 pp leakage memo. Worth verifying whether `train.py` was changed.
+- **2026-05-11 23:15** — resumed from `_last.pt` (start_epoch=51). W&B run id pinned in yaml (`wandb.run_id: d6c7x5rz`) so the dashboard re-attaches. New watchdog: `scripts/ensure_running.sh` + cron `*/2` + `@reboot` (uses `.venv/bin/python` explicitly — prior `@reboot` with bare `python` would have hit /usr/bin/python 3.9, no torch). SWA averager restarts from scratch on this resume; with `start_epoch=35` ≤ current_epoch=51 it begins immediately → **20 SWA averages instead of the planned 35** (ep 51–70).
+- ETA to finish: ~3 h based on the 7 h / 50 ep cadence.

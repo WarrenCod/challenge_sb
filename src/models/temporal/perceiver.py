@@ -20,12 +20,30 @@ Why this rather than a relational head over per-frame CLS tokens:
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
 import torch.nn as nn
 
 from models.base import TemporalProcessor
+
+
+def _sinusoidal_temporal_pos(max_frames: int, dim: int) -> torch.Tensor:
+    """Sinusoidal positional encoding over ``max_frames`` positions, ``dim`` features.
+
+    Standard Vaswani et al. parameterization: even indices use ``sin`` and odd
+    indices use ``cos`` of position scaled by a geometric series of wavelengths
+    from 1 to 10000. Returns a (max_frames, dim) float tensor.
+    """
+    if dim % 2 != 0:
+        raise ValueError(f"sinusoidal pos embed requires even dim; got {dim}")
+    pos = torch.arange(max_frames, dtype=torch.float32).unsqueeze(1)             # (T, 1)
+    div = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32) * -(math.log(10000.0) / dim))
+    pe = torch.zeros(max_frames, dim, dtype=torch.float32)
+    pe[:, 0::2] = torch.sin(pos * div)
+    pe[:, 1::2] = torch.cos(pos * div)
+    return pe
 
 
 class _CrossAttentionBlock(nn.Module):
@@ -75,24 +93,63 @@ class PerceiverHead(TemporalProcessor):
         dropout: float = 0.1,
         max_frames: int = 4,
         out_dim: Optional[int] = None,
+        temporal_pos_init: str = "zero",
+        num_cross_attn: int = 1,
     ) -> None:
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim if out_dim is not None else in_dim
         self.max_frames = int(max_frames)
         self.num_queries = int(num_queries)
+        self.temporal_pos_init = str(temporal_pos_init)
 
         # Learnable queries; std=0.02 init like ViT CLS.
         self.queries = nn.Parameter(torch.zeros(1, self.num_queries, in_dim))
         nn.init.trunc_normal_(self.queries, std=0.02)
 
         # Temporal positional embedding broadcast across patch axis (T entries × D).
-        # Zero-init so step-0 the layer is permutation-symmetric across frames.
-        self.temporal_pos = nn.Parameter(torch.zeros(1, self.max_frames, 1, in_dim))
+        #   "zero"                         → learnable, zero-init; step-0 is
+        #                                    permutation-symmetric across frames.
+        #                                    Used by exp2k..exp2n; default for
+        #                                    backwards-compatible teacher loading.
+        #   "sinusoidal_fixed_with_scale"  → fixed sinusoidal pattern + a single
+        #                                    learnable scalar. Order-aware at
+        #                                    step 0 (exp3a). Stores the pattern
+        #                                    as a buffer to keep parameter
+        #                                    counts unchanged.
+        if self.temporal_pos_init == "zero":
+            self.temporal_pos = nn.Parameter(torch.zeros(1, self.max_frames, 1, in_dim))
+        elif self.temporal_pos_init == "sinusoidal_fixed_with_scale":
+            pe = _sinusoidal_temporal_pos(self.max_frames, in_dim)           # (T, D)
+            self.register_buffer("temporal_pos_buf", pe.view(1, self.max_frames, 1, in_dim))
+            self.temporal_pos_scale = nn.Parameter(torch.ones(1))
+        else:
+            raise ValueError(
+                f"unknown temporal_pos_init {self.temporal_pos_init!r}; "
+                f"expected 'zero' or 'sinusoidal_fixed_with_scale'"
+            )
 
-        self.cross = _CrossAttentionBlock(
-            dim=in_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, dropout=dropout
-        )
+        # Cross-attn stack. exp2*/exp3a use num_cross_attn=1; exp3b sets =2 to
+        # add a second "reader" pass against the patch-token grid. Extra blocks
+        # are zero-init on the attention out_proj AND on the MLP final Linear,
+        # so step-0 forward is bit-identical to num_cross_attn=1 — extra blocks
+        # contribute exactly zero until gradients teach them otherwise.
+        if int(num_cross_attn) < 1:
+            raise ValueError(f"num_cross_attn must be ≥ 1; got {num_cross_attn}")
+        self.num_cross_attn = int(num_cross_attn)
+        self.cross_blocks = nn.ModuleList([
+            _CrossAttentionBlock(
+                dim=in_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, dropout=dropout
+            )
+            for _ in range(self.num_cross_attn)
+        ])
+        for blk in self.cross_blocks[1:]:
+            nn.init.zeros_(blk.attn.out_proj.weight)
+            nn.init.zeros_(blk.attn.out_proj.bias)
+            nn.init.zeros_(blk.mlp[-2].weight)
+            nn.init.zeros_(blk.mlp[-2].bias)
+        # Back-compat alias so old checkpoints (single-block) still load.
+        self.cross = self.cross_blocks[0]
 
         # Self-attention tower on the queries.
         encoder_layer = nn.TransformerEncoderLayer(
@@ -124,11 +181,16 @@ class PerceiverHead(TemporalProcessor):
                 f"T={T} exceeds max_frames={self.max_frames}"
             )
         # add temporal pos embed (T entries, broadcast over the N+1 axis)
-        kv = features + self.temporal_pos[:, :T, :, :]
+        if self.temporal_pos_init == "sinusoidal_fixed_with_scale":
+            pos = self.temporal_pos_scale * self.temporal_pos_buf[:, :T, :, :]
+        else:
+            pos = self.temporal_pos[:, :T, :, :]
+        kv = features + pos
         kv = kv.reshape(B, T * N1, D)            # (B, T*(N+1), D)
 
         q = self.queries.expand(B, -1, -1)       # (B, Q, D)
-        q = self.cross(q, kv)                    # (B, Q, D)
+        for blk in self.cross_blocks:
+            q = blk(q, kv)                       # (B, Q, D)
         q = self.encoder(q)                      # (B, Q, D)
         q = self.norm(q)
         pooled = q.mean(dim=1)                   # (B, D)

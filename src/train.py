@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import hydra
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,10 +30,12 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from dataset.multi_clip_dataset import MultiClipVideoDataset
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from models.cmt import CMT
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
+from models.aux.pair_direction import PairDirectionAuxHead
 from models.aux.predict_next_cls import PredictNextCLSAuxHead
 from models.aux.predict_prev_cls import PredictPrevCLSAuxHead
 from models.modular import attach_aux_head, build_modular_model
@@ -157,6 +160,59 @@ class EnsembleTeacher(nn.Module):
         return torch.log(probs.clamp_min(1e-8))
 
 
+def _sample_shared_mix(
+    clip_a: torch.Tensor,
+    clip_b: torch.Tensor,
+    labels: torch.Tensor,
+    mixup_alpha: float,
+    cutmix_alpha: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Apply Mixup OR CutMix to both clips with a SHARED (lam, perm, box).
+
+    Returns (clip_a_mixed, clip_b_mixed, y_a, y_b, lam). When neither lever is
+    enabled, returns the originals with lam=1.0 and y_a==y_b==labels.
+    """
+    if mixup_alpha > 0 and cutmix_alpha > 0:
+        use_cutmix = random.random() >= 0.5
+    elif mixup_alpha > 0:
+        use_cutmix = False
+    elif cutmix_alpha > 0:
+        use_cutmix = True
+    else:
+        return clip_a, clip_b, labels, labels, 1.0
+
+    B = clip_a.size(0)
+    if use_cutmix:
+        lam_raw = float(np.random.beta(cutmix_alpha, cutmix_alpha))
+        perm = torch.randperm(B, device=clip_a.device)
+        h, w = clip_a.shape[-2], clip_a.shape[-1]
+        cut_ratio = math.sqrt(1.0 - lam_raw)
+        cut_h = int(h * cut_ratio)
+        cut_w = int(w * cut_ratio)
+        if cut_h <= 0 or cut_w <= 0:
+            return clip_a, clip_b, labels, labels, 1.0
+        cy = np.random.randint(h)
+        cx = np.random.randint(w)
+        y1 = max(0, cy - cut_h // 2)
+        y2 = min(h, cy + cut_h // 2)
+        x1 = max(0, cx - cut_w // 2)
+        x2 = min(w, cx + cut_w // 2)
+        if y2 == y1 or x2 == x1:
+            return clip_a, clip_b, labels, labels, 1.0
+        ca = clip_a.clone()
+        cb = clip_b.clone()
+        ca[:, :, :, y1:y2, x1:x2] = clip_a[perm][:, :, :, y1:y2, x1:x2]
+        cb[:, :, :, y1:y2, x1:x2] = clip_b[perm][:, :, :, y1:y2, x1:x2]
+        lam_adj = 1.0 - ((y2 - y1) * (x2 - x1)) / float(h * w)
+        return ca, cb, labels, labels[perm], lam_adj
+
+    lam_raw = float(np.random.beta(mixup_alpha, mixup_alpha))
+    perm = torch.randperm(B, device=clip_a.device)
+    ca = lam_raw * clip_a + (1.0 - lam_raw) * clip_a[perm]
+    cb = lam_raw * clip_b + (1.0 - lam_raw) * clip_b[perm]
+    return ca, cb, labels, labels[perm], lam_raw
+
+
 def train_one_epoch(
     model: nn.Module,
     data_loader: DataLoader,
@@ -175,6 +231,9 @@ def train_one_epoch(
     aux_loss_weight: float = 0.0,
     predict_next_cls_weight: float = 0.0,
     predict_prev_cls_weight: float = 0.0,
+    pair_direction_weight: float = 0.0,
+    multi_clip_enabled: bool = False,
+    consistency_weight: float = 0.0,
     teacher: Optional[nn.Module] = None,
     distill_alpha: float = 0.0,
     distill_temperature: float = 1.0,
@@ -199,10 +258,20 @@ def train_one_epoch(
         and getattr(model, "predict_prev_cls_head", None) is not None
     )
     use_cls_aux = use_predict_next_cls or use_predict_prev_cls
+    use_pair_direction = (
+        pair_direction_weight > 0.0
+        and getattr(model, "pair_direction_head", None) is not None
+    )
     use_distill = teacher is not None and distill_alpha > 0.0
+    use_consistency = multi_clip_enabled and consistency_weight > 0.0
 
-    def _forward_loss(video, y_a, y_b, lam):
-        if use_aux:
+    def _forward_loss(video, y_a, y_b, lam, half_size: Optional[int] = None):
+        if use_pair_direction:
+            logits, frame_cls = model.forward_with_cls(video)   # (Btot, K), (Btot, T, D)
+            main = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+            pair_loss = model.pair_direction_head(frame_cls, y_a, y_b, lam, loss_fn)
+            loss = main + pair_direction_weight * pair_loss
+        elif use_aux:
             logits, aux_logits = model.forward_with_aux(video)  # (B,K), (B,T,K)
             main = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
             B, T, K = aux_logits.shape
@@ -222,6 +291,14 @@ def train_one_epoch(
         else:
             logits = model(video)
             loss = lam * loss_fn(logits, y_a) + (1.0 - lam) * loss_fn(logits, y_b)
+        if use_consistency and half_size is not None:
+            logits_a = logits[:half_size]
+            logits_b = logits[half_size:]
+            log_p_a = F.log_softmax(logits_a, dim=-1)
+            log_p_b = F.log_softmax(logits_b, dim=-1)
+            kl_ab = F.kl_div(log_p_a, log_p_b.detach().exp(), reduction="batchmean")
+            kl_ba = F.kl_div(log_p_b, log_p_a.detach().exp(), reduction="batchmean")
+            loss = loss + consistency_weight * 0.5 * (kl_ab + kl_ba)
         if use_distill:
             with torch.no_grad():
                 teacher_logits = teacher(video)
@@ -235,30 +312,45 @@ def train_one_epoch(
     bar = tqdm(data_loader, desc=f"{epoch_label} train", leave=False, dynamic_ncols=True)
     nan_streak = 0
     MAX_NAN_STREAK = 20
-    for video_batch, labels in bar:
-        # video_batch: (B, T, C, H, W), labels: (B,)
-        video_batch = video_batch.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        # Alternate Mixup / CutMix per batch when both are enabled.
-        if mixup_alpha > 0 and cutmix_alpha > 0:
-            if random.random() < 0.5:
-                video_batch, (y_a, y_b, lam) = mixup_batch(video_batch, labels, mixup_alpha)
-            else:
-                video_batch, (y_a, y_b, lam) = cutmix_batch(video_batch, labels, cutmix_alpha)
-        elif mixup_alpha > 0:
-            video_batch, (y_a, y_b, lam) = mixup_batch(video_batch, labels, mixup_alpha)
-        elif cutmix_alpha > 0:
-            video_batch, (y_a, y_b, lam) = cutmix_batch(video_batch, labels, cutmix_alpha)
+    for batch in bar:
+        if multi_clip_enabled:
+            # Dataset yields (clip_a, clip_b, label). Two augmented views per video.
+            clip_a, clip_b, labels = batch
+            clip_a = clip_a.to(device, non_blocking=True)
+            clip_b = clip_b.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            clip_a, clip_b, y_a_half, y_b_half, lam = _sample_shared_mix(
+                clip_a, clip_b, labels, mixup_alpha, cutmix_alpha
+            )
+            half_size = labels.size(0)
+            video_batch = torch.cat([clip_a, clip_b], dim=0)         # (2B, T, C, H, W)
+            y_a = torch.cat([y_a_half, y_a_half], dim=0)             # (2B,)
+            y_b = torch.cat([y_b_half, y_b_half], dim=0)
         else:
-            y_a, y_b, lam = labels, labels, 1.0
+            # Standard path: dataset yields (video, label).
+            video_batch, labels = batch
+            video_batch = video_batch.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            half_size = None
+            # Alternate Mixup / CutMix per batch when both are enabled.
+            if mixup_alpha > 0 and cutmix_alpha > 0:
+                if random.random() < 0.5:
+                    video_batch, (y_a, y_b, lam) = mixup_batch(video_batch, labels, mixup_alpha)
+                else:
+                    video_batch, (y_a, y_b, lam) = cutmix_batch(video_batch, labels, cutmix_alpha)
+            elif mixup_alpha > 0:
+                video_batch, (y_a, y_b, lam) = mixup_batch(video_batch, labels, mixup_alpha)
+            elif cutmix_alpha > 0:
+                video_batch, (y_a, y_b, lam) = cutmix_batch(video_batch, labels, cutmix_alpha)
+            else:
+                y_a, y_b, lam = labels, labels, 1.0
 
         optimizer.zero_grad(set_to_none=True)
 
         stepped = True
         if amp and scaler is not None:
             with autocast(device_type=device.type, dtype=amp_dtype):
-                logits, loss = _forward_loss(video_batch, y_a, y_b, lam)
+                logits, loss = _forward_loss(video_batch, y_a, y_b, lam, half_size=half_size)
             if not torch.isfinite(loss):
                 nan_streak += 1
                 if nan_streak >= MAX_NAN_STREAK:
@@ -279,7 +371,7 @@ def train_one_epoch(
         elif amp:
             # bf16 path: no grad scaler needed.
             with autocast(device_type=device.type, dtype=amp_dtype):
-                logits, loss = _forward_loss(video_batch, y_a, y_b, lam)
+                logits, loss = _forward_loss(video_batch, y_a, y_b, lam, half_size=half_size)
             if not torch.isfinite(loss):
                 nan_streak += 1
                 if nan_streak >= MAX_NAN_STREAK:
@@ -293,7 +385,7 @@ def train_one_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         else:
-            logits, loss = _forward_loss(video_batch, y_a, y_b, lam)
+            logits, loss = _forward_loss(video_batch, y_a, y_b, lam, half_size=half_size)
             if not torch.isfinite(loss):
                 nan_streak += 1
                 if nan_streak >= MAX_NAN_STREAK:
@@ -312,10 +404,13 @@ def train_one_epoch(
         if ema is not None and stepped:
             ema.update(model)
 
-        running_loss += float(loss.item()) * labels.size(0)
+        # In multi_clip mode, video_batch has 2*B rows but `labels` is still B —
+        # use video_batch.size(0) as the effective sample count for averaging.
+        nsamples = video_batch.size(0)
+        running_loss += float(loss.item()) * nsamples
         predictions = logits.argmax(dim=1)
         correct += int((predictions == y_a).sum().item())
-        total += labels.size(0)
+        total += nsamples
         bar.set_postfix(
             loss=running_loss / total,
             acc=correct / total,
@@ -418,11 +513,24 @@ def main(cfg: DictConfig) -> None:
     # like TSM where per-frame independent crops would scramble the motion signal.
     use_strong_aug = bool(cfg.training.get("strong_clip_aug", False))
     random_temporal_offset = bool(cfg.dataset.get("random_temporal_offset", False))
+
+    # Optional multi-clip training (exp3a): for each video, sample two
+    # independently augmented clips per item. The training loop applies the
+    # SAME (mixup/cutmix lam, perm) to both halves and adds a symmetric KL
+    # consistency loss between their predictions. Requires random_offset_frac
+    # so the two clips don't collapse to identical inputs.
+    mc_cfg = cfg.training.get("multi_clip", None)
+    multi_clip_enabled = mc_cfg is not None and bool(mc_cfg.get("enabled", False))
+    if multi_clip_enabled and not random_temporal_offset:
+        raise ValueError(
+            "training.multi_clip.enabled=true requires dataset.random_temporal_offset=true"
+        )
+    train_dataset_cls = MultiClipVideoDataset if multi_clip_enabled else VideoFrameDataset
     if use_strong_aug:
         train_clip_transform = build_strong_clip_transform(
             image_size=224, use_imagenet_norm=use_imagenet_norm
         )
-        train_dataset = VideoFrameDataset(
+        train_dataset = train_dataset_cls(
             root_dir=train_dir,
             num_frames=int(cfg.dataset.num_frames),
             clip_transform=train_clip_transform,
@@ -430,7 +538,7 @@ def main(cfg: DictConfig) -> None:
             random_offset_frac=random_temporal_offset,
         )
     else:
-        train_dataset = VideoFrameDataset(
+        train_dataset = train_dataset_cls(
             root_dir=train_dir,
             num_frames=int(cfg.dataset.num_frames),
             transform=train_transform,
@@ -439,6 +547,12 @@ def main(cfg: DictConfig) -> None:
         )
     if random_temporal_offset:
         print("[train] random_temporal_offset=True — train clips use Uniform[0,1) offset_frac per item.", flush=True)
+    if multi_clip_enabled:
+        print(
+            f"[train] multi_clip enabled (2 clips/video, consistency KL weight "
+            f"{float(mc_cfg.get('consistency_weight', 0.2))})",
+            flush=True,
+        )
     val_dataset = VideoFrameDataset(
         root_dir=val_dir,
         num_frames=int(cfg.dataset.num_frames),
@@ -519,6 +633,29 @@ def main(cfg: DictConfig) -> None:
         print(
             f"[train] predict-prev-CLS aux enabled (weight={predict_prev_cls_weight}, "
             f"hidden={hidden_dim}, T_in={num_input_frames})"
+        )
+
+    # Optional pairwise-direction head (exp3a): for the 6 ordered (i<j) pairs
+    # of frame CLS tokens, classify the action from
+    # concat[cls_i, cls_j, cls_j-cls_i, cls_i+cls_j] via a 2-layer MLP. Averaged
+    # logits supervised by mixup-aware CE with weight λ_pair. Zero-init fc_out.
+    pdh_cfg = cfg.training.get("pair_direction", None)
+    pair_direction_weight = 0.0
+    if pdh_cfg is not None and bool(pdh_cfg.get("enabled", False)):
+        if cfg.model.name != "modular":
+            raise ValueError("training.pair_direction only supported for model.name=modular")
+        embed_dim = int(model.spatial.out_dim)
+        hidden_dim = int(pdh_cfg.get("hidden_dim", 768))
+        model.pair_direction_head = PairDirectionAuxHead(
+            embed_dim=embed_dim,
+            num_frames=int(cfg.dataset.num_frames),
+            num_classes=int(cfg.model.num_classes),
+            hidden_dim=hidden_dim,
+        ).to(device)
+        pair_direction_weight = float(pdh_cfg.get("weight", 0.3))
+        print(
+            f"[train] pair-direction aux enabled (weight={pair_direction_weight}, "
+            f"hidden={hidden_dim})"
         )
 
     amp_enabled = bool(cfg.training.get("amp", False)) and device.type == "cuda"
@@ -654,6 +791,9 @@ def main(cfg: DictConfig) -> None:
 
     mixup_alpha = float(cfg.training.get("mixup_alpha", 0.0))
     cutmix_alpha = float(cfg.training.get("cutmix_alpha", 0.0))
+    consistency_weight = (
+        float(mc_cfg.get("consistency_weight", 0.0)) if multi_clip_enabled else 0.0
+    )
 
     # Optional self/cross-distillation: KL between student and a frozen teacher
     # on the same (already-mixed) input. alpha splits the loss; T softens both
@@ -708,6 +848,9 @@ def main(cfg: DictConfig) -> None:
             aux_loss_weight=aux_loss_weight,
             predict_next_cls_weight=predict_next_cls_weight,
             predict_prev_cls_weight=predict_prev_cls_weight,
+            pair_direction_weight=pair_direction_weight,
+            multi_clip_enabled=multi_clip_enabled,
+            consistency_weight=consistency_weight,
             teacher=teacher,
             distill_alpha=distill_alpha,
             distill_temperature=distill_temperature,
