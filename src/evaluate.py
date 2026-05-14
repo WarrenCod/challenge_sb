@@ -37,7 +37,9 @@ def load_model_from_checkpoint(checkpoint: Dict[str, Any], device: torch.device)
         )
     cfg = OmegaConf.create(checkpoint["config"])
     model = build_model(cfg)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # strict=False: tolerate training-only aux heads (e.g. pair_direction_head)
+    # that are saved into the state_dict but not part of the inference model.
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     model.to(device)
     model.eval()
     return model

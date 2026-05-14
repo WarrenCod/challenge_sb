@@ -167,7 +167,9 @@ def main(cfg: DictConfig) -> None:
     print(f"Loading checkpoint: {checkpoint_path}", flush=True)
     ckpt: Dict[str, Any] = torch.load(checkpoint_path, map_location="cpu")
     model = build_model_from_checkpoint(ckpt)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # strict=False: tolerate training-only aux heads (e.g. pair_direction_head)
+    # that are saved into the state_dict but not part of the inference model.
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.to(device)
     print(f"Model on device: {device}", flush=True)
 
