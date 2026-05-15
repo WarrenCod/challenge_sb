@@ -14,6 +14,13 @@ hydra:
 
 num_classes: 33
 
+# Submission / evaluate-time TTA defaults. Per-experiment configs may override.
+submission:
+  tta_clips: 1
+  spatial_crops: 1        # 1 (default) or 5 (TL/TR/BL/BR/center spatial TTA)
+  spatial_resize: 256     # frame resize when spatial_crops > 1 (5-crop sees 256→224)
+  dump_probs: false
+
 # Weights & Biases logging (off by default; switch on per-experiment).
 wandb:
   enabled: false

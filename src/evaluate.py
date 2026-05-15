@@ -20,7 +20,12 @@ from torch.utils.data import DataLoader
 
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from train import build_model
-from utils import build_transforms, set_seed
+from utils import (
+    build_eval_transform_with_resize,
+    build_transforms,
+    five_crop_offsets,
+    set_seed,
+)
 
 
 def load_model_from_checkpoint(checkpoint: Dict[str, Any], device: torch.device) -> torch.nn.Module:
@@ -71,7 +76,30 @@ def main(cfg: DictConfig) -> None:
 
     # Normalization must match how the checkpoint was trained (ImageNet stats if pretrained).
     pretrained_used = bool(raw.get("pretrained", cfg.model.get("pretrained", False)))
-    eval_transform = build_transforms(is_training=False, use_imagenet_norm=pretrained_used)
+
+    # Spatial 5-crop TTA (deferred lever from the exp3a note). spatial_crops=1
+    # is the historical single-forward path; spatial_crops=5 resizes frames to
+    # spatial_resize**2 and runs 5 forwards (TL/TR/BL/BR/center crops at 224).
+    submission_cfg = cfg.get("submission", None)
+    spatial_crops = 1
+    spatial_resize = 256
+    image_size = 224
+    if submission_cfg is not None:
+        spatial_crops = int(submission_cfg.get("spatial_crops", 1))
+        spatial_resize = int(submission_cfg.get("spatial_resize", 256))
+    if spatial_crops not in (1, 5):
+        raise ValueError(f"submission.spatial_crops must be 1 or 5, got {spatial_crops}")
+
+    if spatial_crops == 5:
+        eval_transform = build_eval_transform_with_resize(
+            image_size=image_size,
+            resize_size=spatial_resize,
+            use_imagenet_norm=pretrained_used,
+        )
+        crops = list(five_crop_offsets(spatial_resize, image_size))
+    else:
+        eval_transform = build_transforms(is_training=False, use_imagenet_norm=pretrained_used)
+        crops = [None]
 
     val_dir = Path(cfg.dataset.val_dir).resolve()
     val_samples = collect_video_samples(val_dir)
@@ -101,19 +129,35 @@ def main(cfg: DictConfig) -> None:
     correct_top5 = 0
     total = 0
 
+    print(
+        f"Eval passes per video: spatial_crops={spatial_crops}, "
+        f"resize={spatial_resize}, image_size={image_size}",
+        flush=True,
+    )
+
     with torch.no_grad():
         for video_batch, labels in val_loader:
             video_batch = video_batch.to(device)
             labels = labels.to(device)
-            logits = model(video_batch)  # (B, num_classes)
+            # Average softmax over the configured spatial crops; collapses to
+            # a single forward when spatial_crops==1 (crops=[None]).
+            probs_sum = None
+            for crop in crops:
+                inp = video_batch
+                if crop is not None:
+                    oh, ow = crop
+                    inp = video_batch[..., oh:oh + image_size, ow:ow + image_size]
+                logits = model(inp)
+                p = torch.softmax(logits, dim=-1)
+                probs_sum = p if probs_sum is None else probs_sum + p
+            probs = probs_sum / float(len(crops))
 
             # Top-1: argmax class matches label
-            predictions_top1 = logits.argmax(dim=1)
+            predictions_top1 = probs.argmax(dim=1)
             correct_top1 += int((predictions_top1 == labels).sum().item())
 
-            # Top-5: label appears in the five largest logits per row
-            _, predictions_top5 = logits.topk(5, dim=1, largest=True, sorted=True)
-            # (B, 5) compared with (B, 1) -> (B, 5) boolean, True if label in top-5
+            # Top-5: label appears in the five largest probabilities per row
+            _, predictions_top5 = probs.topk(5, dim=1, largest=True, sorted=True)
             matches_top5 = predictions_top5.eq(labels.view(-1, 1)).any(dim=1)
             correct_top5 += int(matches_top5.sum().item())
 

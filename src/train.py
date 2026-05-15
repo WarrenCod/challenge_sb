@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataset.multi_clip_dataset import MultiClipVideoDataset
+from dataset.pseudo_label_dataset import PseudoLabelVideoDataset
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from models.cmt import CMT
 from models.cnn_baseline import CNNBaseline
@@ -422,6 +423,181 @@ def train_one_epoch(
     return average_loss, accuracy
 
 
+def _cycle(iterable):
+    """Yield from `iterable` forever (re-create iterator after exhaustion)."""
+    while True:
+        for x in iterable:
+            yield x
+
+
+def _ce_soft(logits: torch.Tensor, soft_target: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy with soft targets: -sum(y_soft * log_softmax(x)) averaged
+    over the batch. Equivalent to KL(soft_target || softmax(logits)) up to a
+    constant (the soft-target entropy)."""
+    log_p = F.log_softmax(logits, dim=-1)
+    return -(soft_target * log_p).sum(dim=-1).mean()
+
+
+def train_one_epoch_pseudo(
+    model: nn.Module,
+    labeled_loader: DataLoader,
+    pseudo_loader: DataLoader,
+    loss_fn: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    scaler: Optional[GradScaler] = None,
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    grad_clip: float = 0.0,
+    epoch_label: str = "",
+    mixup_alpha: float = 0.0,
+    cutmix_alpha: float = 0.0,
+    ema: Optional[ModelEMA] = None,
+    pair_direction_weight: float = 0.0,
+    pseudo_weight: float = 1.0,
+    teacher: Optional[nn.Module] = None,
+    distill_alpha: float = 0.0,
+    distill_temperature: float = 1.0,
+) -> Tuple[float, float]:
+    """Joint training step: labeled CE/KD/PDH + pseudo CE-soft on test data.
+
+    Each step pulls one labeled batch (size L) and one pseudo batch (size P)
+    in parallel; the pseudo loader is cycled because it has fewer samples.
+    Two separate forwards keep the PDH/KD code paths unchanged on the
+    labeled half and avoid running them on noisy pseudo samples.
+
+    Combined loss is sample-weighted: total = (L * loss_l + P * loss_p) / (L+P),
+    optionally scaled by `pseudo_weight` on the pseudo half.
+    """
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    use_pair_direction = (
+        pair_direction_weight > 0.0
+        and getattr(model, "pair_direction_head", None) is not None
+    )
+    use_distill = teacher is not None and distill_alpha > 0.0
+
+    pseudo_iter = iter(_cycle(pseudo_loader))
+
+    def _forward_loss(video_l, y_a, y_b, lam, video_p, soft_p):
+        if use_pair_direction:
+            logits_l, frame_cls_l = model.forward_with_cls(video_l)
+            main_l = lam * loss_fn(logits_l, y_a) + (1.0 - lam) * loss_fn(logits_l, y_b)
+            pair_l = model.pair_direction_head(frame_cls_l, y_a, y_b, lam, loss_fn)
+            loss_l = main_l + pair_direction_weight * pair_l
+        else:
+            logits_l = model(video_l)
+            loss_l = lam * loss_fn(logits_l, y_a) + (1.0 - lam) * loss_fn(logits_l, y_b)
+        if use_distill:
+            with torch.no_grad():
+                teacher_logits = teacher(video_l)
+            tk = distill_temperature
+            student_logp = F.log_softmax(logits_l / tk, dim=-1)
+            teacher_p = F.softmax(teacher_logits / tk, dim=-1)
+            kd = F.kl_div(student_logp, teacher_p, reduction="batchmean") * (tk * tk)
+            loss_l = (1.0 - distill_alpha) * loss_l + distill_alpha * kd
+
+        logits_p = model(video_p)
+        loss_p = _ce_soft(logits_p, soft_p)
+
+        L = video_l.size(0)
+        P = video_p.size(0)
+        total_loss = (L * loss_l + pseudo_weight * P * loss_p) / float(L + P)
+        return logits_l, logits_p, total_loss
+
+    bar = tqdm(labeled_loader, desc=f"{epoch_label} train", leave=False, dynamic_ncols=True)
+    nan_streak = 0
+    MAX_NAN_STREAK = 20
+    for video_l, labels in bar:
+        video_l = video_l.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        if mixup_alpha > 0 and cutmix_alpha > 0:
+            if random.random() < 0.5:
+                video_l, (y_a, y_b, lam) = mixup_batch(video_l, labels, mixup_alpha)
+            else:
+                video_l, (y_a, y_b, lam) = cutmix_batch(video_l, labels, cutmix_alpha)
+        elif mixup_alpha > 0:
+            video_l, (y_a, y_b, lam) = mixup_batch(video_l, labels, mixup_alpha)
+        elif cutmix_alpha > 0:
+            video_l, (y_a, y_b, lam) = cutmix_batch(video_l, labels, cutmix_alpha)
+        else:
+            y_a, y_b, lam = labels, labels, 1.0
+
+        video_p, soft_p = next(pseudo_iter)
+        video_p = video_p.to(device, non_blocking=True)
+        soft_p = soft_p.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        stepped = True
+        if amp and scaler is not None:
+            with autocast(device_type=device.type, dtype=amp_dtype):
+                logits_l, logits_p, loss = _forward_loss(video_l, y_a, y_b, lam, video_p, soft_p)
+            if not torch.isfinite(loss):
+                nan_streak += 1
+                if nan_streak >= MAX_NAN_STREAK:
+                    raise RuntimeError(f"Training diverged: {nan_streak} consecutive non-finite losses.")
+                continue
+            nan_streak = 0
+            scaler.scale(loss).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            prev_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            stepped = scaler.get_scale() >= prev_scale
+        elif amp:
+            with autocast(device_type=device.type, dtype=amp_dtype):
+                logits_l, logits_p, loss = _forward_loss(video_l, y_a, y_b, lam, video_p, soft_p)
+            if not torch.isfinite(loss):
+                nan_streak += 1
+                if nan_streak >= MAX_NAN_STREAK:
+                    raise RuntimeError(f"Training diverged: {nan_streak} consecutive non-finite losses.")
+                continue
+            nan_streak = 0
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+        else:
+            logits_l, logits_p, loss = _forward_loss(video_l, y_a, y_b, lam, video_p, soft_p)
+            if not torch.isfinite(loss):
+                nan_streak += 1
+                if nan_streak >= MAX_NAN_STREAK:
+                    raise RuntimeError(f"Training diverged: {nan_streak} consecutive non-finite losses.")
+                continue
+            nan_streak = 0
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+        if scheduler is not None and stepped:
+            scheduler.step()
+        if ema is not None and stepped:
+            ema.update(model)
+
+        nsamples_l = video_l.size(0)
+        running_loss += float(loss.item()) * nsamples_l
+        # Train acc reported on labeled half only (pseudo has no hard label).
+        predictions = logits_l.argmax(dim=1)
+        correct += int((predictions == y_a).sum().item())
+        total += nsamples_l
+        bar.set_postfix(
+            loss=running_loss / total,
+            acc=correct / total,
+            lr=optimizer.param_groups[0]["lr"],
+        )
+
+    average_loss = running_loss / max(total, 1)
+    accuracy = correct / max(total, 1)
+    return average_loss, accuracy
+
+
 @torch.no_grad()
 def evaluate_epoch(
     model: nn.Module,
@@ -560,9 +736,62 @@ def main(cfg: DictConfig) -> None:
         sample_list=val_samples,
     )
 
+    # Pseudo-label (noisy-student) parallel loader. When enabled, each training
+    # step consumes `pseudo_per_batch` test videos with ensemble soft targets
+    # alongside `batch_size - pseudo_per_batch` labeled train videos — the
+    # total per-step forward stays at `batch_size`.
+    pseudo_cfg = cfg.training.get("pseudo_labels", None)
+    pseudo_enabled = pseudo_cfg is not None and bool(pseudo_cfg.get("enabled", False))
+    pseudo_per_batch = int(pseudo_cfg.get("pseudo_per_batch", 4)) if pseudo_enabled else 0
+    pseudo_weight = float(pseudo_cfg.get("weight", 1.0)) if pseudo_enabled else 0.0
+    pseudo_loader: Optional[DataLoader] = None
+    if pseudo_enabled:
+        if multi_clip_enabled:
+            raise ValueError("training.pseudo_labels is not compatible with training.multi_clip")
+        labeled_bs = int(cfg.training.batch_size) - pseudo_per_batch
+        if labeled_bs <= 0:
+            raise ValueError(
+                f"pseudo_per_batch={pseudo_per_batch} must be < batch_size={cfg.training.batch_size}"
+            )
+        pseudo_file = Path(str(pseudo_cfg.path)).resolve()
+        if not pseudo_file.is_file():
+            raise FileNotFoundError(f"pseudo_labels.path not found: {pseudo_file}")
+        if use_strong_aug:
+            pseudo_dataset = PseudoLabelVideoDataset(
+                test_dir=Path(cfg.dataset.test_dir).resolve(),
+                pseudo_file=pseudo_file,
+                num_frames=int(cfg.dataset.num_frames),
+                clip_transform=train_clip_transform,
+                random_offset_frac=True,
+            )
+        else:
+            pseudo_dataset = PseudoLabelVideoDataset(
+                test_dir=Path(cfg.dataset.test_dir).resolve(),
+                pseudo_file=pseudo_file,
+                num_frames=int(cfg.dataset.num_frames),
+                transform=train_transform,
+                random_offset_frac=True,
+            )
+        print(
+            f"[train] pseudo-label noisy-student enabled: {len(pseudo_dataset)} pseudo videos, "
+            f"labeled_bs={labeled_bs} + pseudo_bs={pseudo_per_batch} per step, "
+            f"weight={pseudo_weight}, file={pseudo_file.name}",
+            flush=True,
+        )
+        pseudo_loader = DataLoader(
+            pseudo_dataset,
+            batch_size=pseudo_per_batch,
+            shuffle=True,
+            num_workers=max(2, int(cfg.training.num_workers) // 2),
+            pin_memory=(device.type == "cuda"),
+            drop_last=True,
+        )
+    else:
+        labeled_bs = int(cfg.training.batch_size)
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=int(cfg.training.batch_size),
+        batch_size=labeled_bs,
         shuffle=True,
         num_workers=int(cfg.training.num_workers),
         pin_memory=(device.type == "cuda"),
@@ -830,31 +1059,56 @@ def main(cfg: DictConfig) -> None:
 
     for epoch in range(start_epoch, int(cfg.training.epochs)):
         label = f"[{epoch + 1}/{cfg.training.epochs}]"
-        train_loss, train_acc = train_one_epoch(
-            model,
-            train_loader,
-            loss_fn,
-            optimizer,
-            device,
-            scheduler=scheduler,
-            scaler=scaler,
-            amp=amp_enabled,
-            amp_dtype=amp_dtype,
-            grad_clip=grad_clip,
-            epoch_label=label,
-            mixup_alpha=mixup_alpha,
-            cutmix_alpha=cutmix_alpha,
-            ema=ema,
-            aux_loss_weight=aux_loss_weight,
-            predict_next_cls_weight=predict_next_cls_weight,
-            predict_prev_cls_weight=predict_prev_cls_weight,
-            pair_direction_weight=pair_direction_weight,
-            multi_clip_enabled=multi_clip_enabled,
-            consistency_weight=consistency_weight,
-            teacher=teacher,
-            distill_alpha=distill_alpha,
-            distill_temperature=distill_temperature,
-        )
+        if pseudo_enabled:
+            assert pseudo_loader is not None
+            train_loss, train_acc = train_one_epoch_pseudo(
+                model,
+                train_loader,
+                pseudo_loader,
+                loss_fn,
+                optimizer,
+                device,
+                scheduler=scheduler,
+                scaler=scaler,
+                amp=amp_enabled,
+                amp_dtype=amp_dtype,
+                grad_clip=grad_clip,
+                epoch_label=label,
+                mixup_alpha=mixup_alpha,
+                cutmix_alpha=cutmix_alpha,
+                ema=ema,
+                pair_direction_weight=pair_direction_weight,
+                pseudo_weight=pseudo_weight,
+                teacher=teacher,
+                distill_alpha=distill_alpha,
+                distill_temperature=distill_temperature,
+            )
+        else:
+            train_loss, train_acc = train_one_epoch(
+                model,
+                train_loader,
+                loss_fn,
+                optimizer,
+                device,
+                scheduler=scheduler,
+                scaler=scaler,
+                amp=amp_enabled,
+                amp_dtype=amp_dtype,
+                grad_clip=grad_clip,
+                epoch_label=label,
+                mixup_alpha=mixup_alpha,
+                cutmix_alpha=cutmix_alpha,
+                ema=ema,
+                aux_loss_weight=aux_loss_weight,
+                predict_next_cls_weight=predict_next_cls_weight,
+                predict_prev_cls_weight=predict_prev_cls_weight,
+                pair_direction_weight=pair_direction_weight,
+                multi_clip_enabled=multi_clip_enabled,
+                consistency_weight=consistency_weight,
+                teacher=teacher,
+                distill_alpha=distill_alpha,
+                distill_temperature=distill_temperature,
+            )
         eval_model = ema.module if ema is not None else model
         val_loss, val_acc = evaluate_epoch(
             eval_model,

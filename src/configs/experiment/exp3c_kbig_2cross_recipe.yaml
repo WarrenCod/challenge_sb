@@ -1,0 +1,89 @@
+# @package _global_
+# exp3c (Track 1): isolation run on top of exp3a (0.4937 real val), no pseudo.
+# Bundled K-bump + architectural + recipe lever stack:
+#   1. K = 6 → 8 ST blocks (last 8: blocks 4..11; was 6..11). The K-axis
+#      sweet spot above K=6: 4 spatial-only blocks preserve MAE features,
+#      4 ST blocks at the top of the encoder.
+#   2. Perceiver cross-attn 1 → 2 (second block zero-init → step-0 identical
+#      to exp3a). Self-attn stays at 4 (saturating).
+#   3. Recipe surgery: ep 55→35, warmup 8→5, LS 0.15→0.10, drop_path
+#      0.30→0.25, Perceiver dropout 0.30→0.20, drop multi_clip (suspected
+#      wash on exp3a). batch_size 8(×2)→16 straight.
+# Distillation, PDH, EMA, mixup/cutmix, LR, LLRD, WD, num_frames, seed:
+# all unchanged from exp3a (PDH λ stays at 0.3 — not the lever here).
+# NO pseudo-label distillation (the lever exp3b is testing separately).
+defaults:
+  - override /model: vit_mae_st_perceiver
+
+model:
+  spatial:
+    drop_path: 0.25
+    drop_path_schedule: linear   # 0.0 → 0.25 per-block (was 0.30 in exp3a)
+    space_time_layers: 8         # NEW: 6 → 8; last 8 ViT blocks become ST blocks
+  temporal:
+    num_layers: 4
+    dropout: 0.20                 # was 0.30 — recipe surgery
+    temporal_pos_init: sinusoidal_fixed_with_scale
+    num_cross_attn: 2             # NEW: 1 → 2 cross-attn blocks (extra zero-init)
+
+dataset:
+  num_frames: 4
+  seed: 1337
+  random_temporal_offset: true
+
+training:
+  batch_size: 16                 # straight 16 (no multi_clip 2x split)
+  lr: 1.5e-4
+  llrd: 0.70
+  epochs: 35                     # was 55 — recipe surgery
+  warmup_epochs: 5               # was 8 — scaled with shorter total
+  weight_decay: 0.05
+  label_smoothing: 0.10           # was 0.15 — recipe surgery
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 0.5
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp3c_kbig_2cross_recipe.pt
+  device: cuda
+  distill:
+    teacher_ckpt:
+      - ${hydra:runtime.cwd}/checkpoints/exp2m_st_perceiver.pt
+      - ${hydra:runtime.cwd}/checkpoints/exp2n_bornagain_bidir_swa.pt
+    combine: softmax_mean
+    alpha: 0.5                    # match exp3a (without pseudo carrying load)
+    temperature: 4.0
+  pair_direction:
+    enabled: true
+    weight: 0.3                   # match exp3a (PDH isn't the lever here)
+    hidden_dim: 768
+
+submission:
+  tta_clips: 1                    # TTA=5 confirmed wash
+
+wandb:
+  enabled: true
+  run_name: exp3c_kbig_2cross_recipe
+  run_id: exp3c_kbig_2cross_recipe
+  tags:
+    [
+      track1,
+      stage2,
+      mae,
+      perceiver,
+      timesformer,
+      spacetime,
+      distill,
+      ensemble_teacher,
+      ema,
+      cutmix,
+      pair_direction,
+      kbig,
+      cross_attn_2,
+      recipe_surgery,
+      no_pseudo,
+      real_val,
+    ]

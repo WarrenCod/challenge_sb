@@ -1,0 +1,92 @@
+# @package _global_
+# exp3b (Track 1): noisy-student on test set + recipe surgery + 2 cross-attn.
+# Three orthogonal levers stacked on top of exp3a's best (real val 0.4937):
+#   1. PSEUDO-LABEL DISTILLATION on processed_data/test (the only proposed lever
+#      that adds NEW information — see ensemble probe 2026-05-14: encoder
+#      bottleneck means TTA/ensemble plateau, pseudo-labels add data).
+#      Soft targets from softmax-mean{exp2m, exp2n, exp3a}, filtered by
+#      max_prob >= 0.7 AND all-3-argmax-agree (both gates).
+#   2. PERCEIVER 2-CROSS-ATTN (1 → 2). The actual reader against patch
+#      tokens; self-attn on 16 queries is saturating, cross-attn was never
+#      tested. Second block zero-init → step-0 forward identical to exp3a.
+#   3. RECIPE SURGERY. exp3a val-loss bottomed at ep 25 then climbed.
+#      Shorter schedule, lighter smoothing, drop multi_clip (suspected wash).
+defaults:
+  - override /model: vit_mae_st_perceiver
+
+model:
+  spatial:
+    drop_path: 0.25
+    drop_path_schedule: linear   # 0.0 → 0.25 per-block (was 0.30 in exp3a)
+    space_time_layers: 6         # unchanged from exp3a (K-scaling diminishing)
+  temporal:
+    num_layers: 4
+    dropout: 0.20                 # was 0.30 — less reg to match shorter schedule
+    temporal_pos_init: sinusoidal_fixed_with_scale
+    num_cross_attn: 2             # NEW: 1 → 2 cross-attn blocks (extra is zero-init)
+
+dataset:
+  num_frames: 4
+  seed: 1337
+  random_temporal_offset: true
+
+training:
+  batch_size: 16                 # total per-step (12 labeled + 4 pseudo, see pseudo_per_batch)
+  lr: 1.5e-4
+  llrd: 0.70
+  epochs: 35                     # was 55; val-loss bottomed at ep 25
+  warmup_epochs: 5
+  weight_decay: 0.05
+  label_smoothing: 0.10           # was 0.15 — recipe surgery
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0
+  strong_clip_aug: true
+  amp: true
+  grad_clip: 0.5
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp3b_noisystudent_pseudo_test.pt
+  device: cuda
+  distill:
+    teacher_ckpt:
+      - ${hydra:runtime.cwd}/checkpoints/exp2m_st_perceiver.pt
+      - ${hydra:runtime.cwd}/checkpoints/exp2n_bornagain_bidir_swa.pt
+      - ${hydra:runtime.cwd}/checkpoints/exp3a_vivit_pairwise_multiclip.pt
+    combine: softmax_mean
+    alpha: 0.4
+    temperature: 4.0
+  pair_direction:
+    enabled: true
+    weight: 0.2                   # was 0.3 — pseudo soft targets carry direction signal too
+    hidden_dim: 768
+  pseudo_labels:
+    enabled: true
+    path: ${hydra:runtime.cwd}/processed_data/pseudo_labels_v1.pt
+    pseudo_per_batch: 4           # out of batch_size=16; remaining 12 are labeled
+    weight: 1.0                   # scale on pseudo loss term
+
+submission:
+  tta_clips: 1
+
+wandb:
+  enabled: true
+  run_name: exp3b_noisystudent_pseudo_test
+  run_id: exp3b_noisystudent_pseudo_test
+  tags:
+    [
+      track1,
+      stage2,
+      mae,
+      perceiver,
+      timesformer,
+      spacetime,
+      distill,
+      ensemble_teacher,
+      ema,
+      cutmix,
+      pair_direction,
+      noisy_student,
+      pseudo_labels,
+      real_val,
+    ]

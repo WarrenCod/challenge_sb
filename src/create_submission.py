@@ -28,7 +28,12 @@ from torch.utils.data import DataLoader
 
 from dataset.video_dataset import VideoFrameDataset
 from train import build_model
-from utils import build_transforms, set_seed
+from utils import (
+    build_eval_transform_with_resize,
+    build_transforms,
+    five_crop_offsets,
+    set_seed,
+)
 
 
 def load_manifest_video_names(manifest_path: Path) -> List[str]:
@@ -125,12 +130,18 @@ def run_inference_softmax(
     device: torch.device,
     total_videos: int,
     pass_label: str = "",
+    crop: Tuple[int, int] | None = None,
+    crop_size: int = 224,
 ) -> torch.Tensor:
     """Run the model on the loader; return per-clip softmax probabilities.
 
     Returns a (N, K) CPU float32 tensor, where N = total_videos and K is the
     number of classes. Order matches the loader (loader must be unshuffled).
     Used by both the single-pass and TTA paths.
+
+    When ``crop`` is given as ``(oh, ow)`` each batch is sliced
+    ``[..., oh:oh+crop_size, ow:ow+crop_size]`` before the forward — enables
+    spatial 5-crop TTA against a dataset built with a larger resize.
     """
     model.eval()
     parts: List[torch.Tensor] = []
@@ -139,6 +150,9 @@ def run_inference_softmax(
     processed = 0
     for batch_idx, (video_batch, _labels) in enumerate(loader, start=1):
         video_batch = video_batch.to(device)
+        if crop is not None:
+            oh, ow = crop
+            video_batch = video_batch[..., oh:oh + crop_size, ow:ow + crop_size]
         logits = model(video_batch)
         probs = torch.softmax(logits, dim=-1).float().cpu()
         parts.append(probs)
@@ -186,7 +200,6 @@ def main(cfg: DictConfig) -> None:
 
     num_frames = int(ckpt.get("num_frames", cfg.dataset.num_frames))
     pretrained = bool(ckpt.get("pretrained", cfg.model.get("pretrained", False)))
-    eval_transform = build_transforms(is_training=False, use_imagenet_norm=pretrained)
 
     test_root = Path(cfg.dataset.test_dir).resolve()
     output_path = Path(cfg.dataset.submission_output).resolve()
@@ -216,20 +229,42 @@ def main(cfg: DictConfig) -> None:
 
     submission_cfg = cfg.get("submission", None)
     tta_clips = 1
+    spatial_crops = 1
+    spatial_resize = 256
+    image_size = 224
     dump_probs = False
     if submission_cfg is not None:
         tta_clips = int(submission_cfg.get("tta_clips", 1))
+        spatial_crops = int(submission_cfg.get("spatial_crops", 1))
+        spatial_resize = int(submission_cfg.get("spatial_resize", 256))
         dump_probs = bool(submission_cfg.get("dump_probs", False))
     if tta_clips < 1:
         raise ValueError(f"submission.tta_clips must be >= 1, got {tta_clips}")
+    if spatial_crops not in (1, 5):
+        raise ValueError(f"submission.spatial_crops must be 1 or 5, got {spatial_crops}")
+
+    if spatial_crops == 5:
+        eval_transform = build_eval_transform_with_resize(
+            image_size=image_size,
+            resize_size=spatial_resize,
+            use_imagenet_norm=pretrained,
+        )
+        crops: List[Tuple[int, int] | None] = list(
+            five_crop_offsets(spatial_resize, image_size)
+        )
+    else:
+        eval_transform = build_transforms(is_training=False, use_imagenet_norm=pretrained)
+        crops = [None]
 
     # N distinct temporal offsets evenly spread over [0, 1) for TTA. With
     # tta_clips=1 we get offset_frac=0.0, i.e. the historical single-pass path.
     offsets = [k / tta_clips for k in range(tta_clips)]
     batch_size = int(cfg.training.batch_size)
+    total_passes = tta_clips * len(crops)
 
     accum: torch.Tensor | None = None
-    for pass_idx, offset in enumerate(offsets, start=1):
+    pass_idx = 0
+    for offset_idx, offset in enumerate(offsets, start=1):
         dataset = VideoFrameDataset(
             root_dir=test_root,
             num_frames=num_frames,
@@ -244,26 +279,36 @@ def main(cfg: DictConfig) -> None:
             num_workers=int(cfg.training.num_workers),
             pin_memory=(device.type == "cuda"),
         )
-        pass_label = (
-            f"[tta {pass_idx}/{tta_clips} offset={offset:.3f}]"
-            if tta_clips > 1
-            else ""
-        )
-        if pass_idx == 1:
+        if offset_idx == 1:
             print(
                 f"Starting inference: {len(dataset)} clips, batch_size={batch_size}, "
-                f"{len(loader)} batches, tta_clips={tta_clips}",
+                f"{len(loader)} batches, tta_clips={tta_clips}, "
+                f"spatial_crops={spatial_crops}, total_passes={total_passes}",
                 flush=True,
             )
-        else:
-            print(f"  TTA pass {pass_idx}/{tta_clips} (offset_frac={offset:.3f})", flush=True)
-        probs = run_inference_softmax(
-            model, loader, device, total_videos=len(dataset), pass_label=pass_label
-        )
-        accum = probs if accum is None else accum + probs
+        for crop_idx, crop in enumerate(crops, start=1):
+            pass_idx += 1
+            crop_tag = f" crop={crop_idx}/{len(crops)}" if len(crops) > 1 else ""
+            pass_label = (
+                f"[pass {pass_idx}/{total_passes} t_off={offset:.3f}{crop_tag}]"
+                if total_passes > 1
+                else ""
+            )
+            if total_passes > 1:
+                print(f"  {pass_label}", flush=True)
+            probs = run_inference_softmax(
+                model,
+                loader,
+                device,
+                total_videos=len(dataset),
+                pass_label=pass_label,
+                crop=crop,
+                crop_size=image_size,
+            )
+            accum = probs if accum is None else accum + probs
 
     assert accum is not None
-    avg_probs = accum / float(tta_clips)
+    avg_probs = accum / float(total_passes)
     predictions: List[int] = avg_probs.argmax(dim=-1).tolist()
     print("Inference finished.", flush=True)
 

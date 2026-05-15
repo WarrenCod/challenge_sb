@@ -129,27 +129,31 @@ class PerceiverHead(TemporalProcessor):
                 f"expected 'zero' or 'sinusoidal_fixed_with_scale'"
             )
 
-        # Cross-attn stack. exp2*/exp3a use num_cross_attn=1; exp3b sets =2 to
-        # add a second "reader" pass against the patch-token grid. Extra blocks
-        # are zero-init on the attention out_proj AND on the MLP final Linear,
-        # so step-0 forward is bit-identical to num_cross_attn=1 — extra blocks
-        # contribute exactly zero until gradients teach them otherwise.
+        # Cross-attn stack. `self.cross` is always the first block (preserves
+        # state_dict key compatibility with exp2*/exp3a checkpoints). When
+        # num_cross_attn>1, additional blocks go in `self.cross_extra` and are
+        # zero-init on attention out_proj AND MLP final Linear, so the step-0
+        # forward is bit-identical to num_cross_attn=1.
         if int(num_cross_attn) < 1:
             raise ValueError(f"num_cross_attn must be ≥ 1; got {num_cross_attn}")
         self.num_cross_attn = int(num_cross_attn)
-        self.cross_blocks = nn.ModuleList([
-            _CrossAttentionBlock(
-                dim=in_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, dropout=dropout
-            )
-            for _ in range(self.num_cross_attn)
-        ])
-        for blk in self.cross_blocks[1:]:
-            nn.init.zeros_(blk.attn.out_proj.weight)
-            nn.init.zeros_(blk.attn.out_proj.bias)
-            nn.init.zeros_(blk.mlp[-2].weight)
-            nn.init.zeros_(blk.mlp[-2].bias)
-        # Back-compat alias so old checkpoints (single-block) still load.
-        self.cross = self.cross_blocks[0]
+        self.cross = _CrossAttentionBlock(
+            dim=in_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, dropout=dropout
+        )
+        if self.num_cross_attn > 1:
+            self.cross_extra = nn.ModuleList([
+                _CrossAttentionBlock(
+                    dim=in_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, dropout=dropout
+                )
+                for _ in range(self.num_cross_attn - 1)
+            ])
+            for blk in self.cross_extra:
+                nn.init.zeros_(blk.attn.out_proj.weight)
+                nn.init.zeros_(blk.attn.out_proj.bias)
+                nn.init.zeros_(blk.mlp[-2].weight)
+                nn.init.zeros_(blk.mlp[-2].bias)
+        else:
+            self.cross_extra = nn.ModuleList()
 
         # Self-attention tower on the queries.
         encoder_layer = nn.TransformerEncoderLayer(
@@ -189,7 +193,8 @@ class PerceiverHead(TemporalProcessor):
         kv = kv.reshape(B, T * N1, D)            # (B, T*(N+1), D)
 
         q = self.queries.expand(B, -1, -1)       # (B, Q, D)
-        for blk in self.cross_blocks:
+        q = self.cross(q, kv)                    # (B, Q, D)
+        for blk in self.cross_extra:
             q = blk(q, kv)                       # (B, Q, D)
         q = self.encoder(q)                      # (B, Q, D)
         q = self.norm(q)

@@ -68,6 +68,51 @@ def build_transforms(
     )
 
 
+def build_eval_transform_with_resize(
+    image_size: int = 224,
+    resize_size: Optional[int] = None,
+    use_imagenet_norm: bool = True,
+) -> transforms.Compose:
+    """Eval transform with an arbitrary resize size; ToTensor + Normalize.
+
+    When ``resize_size`` > ``image_size`` the dataset returns
+    ``resize_size``-square frames and the caller slices them into multiple
+    spatial crops for TTA. ``resize_size=None`` collapses to the historical
+    ``build_transforms(is_training=False)`` behaviour.
+    """
+    if resize_size is None:
+        resize_size = image_size
+    if use_imagenet_norm:
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+    else:
+        normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    return transforms.Compose(
+        [
+            transforms.Resize((resize_size, resize_size)),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+
+
+def five_crop_offsets(resize_size: int, image_size: int) -> List[Tuple[int, int]]:
+    """5-crop spatial TTA offsets: TL, TR, BL, BR, center."""
+    if resize_size < image_size:
+        raise ValueError(
+            f"resize_size {resize_size} must be >= image_size {image_size}"
+        )
+    s = resize_size - image_size
+    return [
+        (0, 0),
+        (0, s),
+        (s, 0),
+        (s, s),
+        (s // 2, s // 2),
+    ]
+
+
 @torch.no_grad()
 def accuracy_topk(
     logits: torch.Tensor,
