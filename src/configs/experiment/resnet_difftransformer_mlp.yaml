@@ -1,6 +1,0 @@
-# @package _global_
-# ResNet18 spatial + DiffTransformer temporal + MLP head, from scratch.
-# Temporal block concatenates each frame feature with the forward-difference
-# feature (learnable end sentinel) and runs self-attention at d_model=2d.
-defaults:
-  - override /model: resnet_difftransformer_mlp

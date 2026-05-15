@@ -1,4 +1,0 @@
-# @package _global_
-# Modular experiment: ViT-S/16 spatial + Transformer temporal + MLP head, from scratch.
-defaults:
-  - override /model: vit_transformer_mlp
