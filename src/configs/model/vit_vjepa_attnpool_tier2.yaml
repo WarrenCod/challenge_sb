@@ -1,0 +1,24 @@
+# @package _global_
+# Frozen-encoder probe on V-JEPA Tier-2 with attention pooling instead of mean.
+# Encoder: V-JEPA Tier-2 ViT-S/16 (tubelet=2), frozen.
+# Spatial pool: learned-query cross-attention over (1 + T_tok*N) tokens per
+# T_tok slice -> (B, T_tok, D). Adds ~0.6 M trainable params (one MHA + LN +
+# query token) on top of the linear classifier. Temporal: mean over T_tok.
+# Tests whether mean-pooling was the bottleneck on the Tier-2 probe.
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: vit_mae
+    variant: vit_s_16
+    image_size: 224
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1_tier2.pt
+    drop_path: 0.0
+    pool: attn_pool
+    freeze: true
+    tubelet_size: 2
+    num_frames: 4
+  temporal:
+    name: mean_pool
+  classifier:
+    name: linear

@@ -1,27 +1,33 @@
 """
-V-JEPA Tier-1: multi-frame masked-target prediction.
+V-JEPA: spacetime masked-feature prediction. Three recipes share one module:
 
-Self-supervised on T-frame clips. Two ViT-S/16 encoders (context f_theta and
-EMA target f_theta_bar) share architecture, applied per-frame so the encoder
-stays MAE/iBOT-compatible for Stage 2. The predictor consumes the full
-spacetime grid of context patch tokens (B, T*N, D), replaces masked positions
-with a learnable mask query (mask_token + space-pos + time-pos), runs joint
-self-attention, and predicts the EMA target encoder's patch features only at
-the masked positions.
+  * "block3d" + "smooth_l1_lnboth"  — legacy (Tier-1/Tier-2/v3a). Single
+    random 3D-block mask per clip, smooth_L1 with parameter-free LayerNorm
+    on both prediction and target.
 
-Block masking: per sample, mask K rectangles in the (H, W) grid lifted across
-all T frames. The same spatial holes appear in every frame, so the predictor
-must use spatial neighbours to fill them — and where holes coincide with
-moving content, temporal redundancy across frames carries the signal. Mask
-ratio ~0.75 forces the encoder to produce dense, locally-informative features
-(MAE-style pressure) rather than collapse to "next frame ≈ this frame".
+  * "vjepa" + "l1_lntarget"         — V-JEPA 1 port (v4). M distinct masks
+    per clip per step (multi-mask), each the union of `n_long_blocks`
+    long-range tubes (large spatial scale) and `n_short_blocks` short-range
+    tubes (small spatial scale), all lifted across the full T_tok dimension.
+    Loss is L1 with parameter-free LayerNorm on the target only — matches
+    the V-JEPA 1 paper modulo flip (disabled here for SSv2 direction).
 
-Loss: smooth_L1 in feature space at masked positions, scale-aligned via
-parameter-free LayerNorm on both prediction and target.
+  * "tube_block_v7" + "jepa_pixel" — v7 hybrid. One large rectangular tube
+    masked across all T_tok slices at ~90% ratio (motion-forcing), and a
+    dual-objective predictor: feature-prediction (L1 vs LN target) PLUS
+    pixel reconstruction (L2 vs per-patch-LN RGB). Pixel target is
+    non-gameable, anchoring against the appearance-shortcut collapse that
+    capped v3a→v6 probes at ~9.6%.
 
-The saved EMA-encoder dump still uses the same key layout as MAE / iBOT
-(`encoder_state_dict`), so Stage 2 loads it via the existing ViTMAEEncoder
-without renaming.
+Multi-mask (M ≥ 2) reuses the encoder forward across M predictor passes:
+the encoder is the dominant cost, so each step yields ~M× learning signal
+for ~1.3× wall-clock. This is the central sample-efficiency lever from
+V-JEPA 1 / V-JEPA 2.
+
+Encoder layout (`VJEPAEncoder`, `TubeletPatchEmbed`, state-dict key prefix
+list) is unchanged across recipes. The saved EMA-encoder dump still uses
+the MAE/iBOT key layout (`encoder_state_dict`), so Stage 2 loads it via the
+existing `ViTMAEEncoder` without renaming.
 """
 
 from __future__ import annotations
@@ -215,12 +221,14 @@ class JEPAPredictor(nn.Module):
         num_patches: int = 196,
         max_frames: int = 8,
         drop_path_rate: float = 0.0,
+        pixel_out_dim: int = 0,
     ) -> None:
         super().__init__()
         self.encoder_dim = encoder_dim
         self.predictor_dim = predictor_dim
         self.num_patches = num_patches
         self.max_frames = max_frames
+        self.pixel_out_dim = pixel_out_dim
 
         self.proj_in = nn.Linear(encoder_dim, predictor_dim)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_dim))
@@ -246,6 +254,15 @@ class JEPAPredictor(nn.Module):
         self.norm = nn.LayerNorm(predictor_dim)
         self.proj_out = nn.Linear(predictor_dim, encoder_dim)
 
+        # Optional pixel-reconstruction head (v7). Narrow projection from the
+        # predictor's normalized output to per-tubelet RGB. Kept lightweight
+        # (LN + Linear) so the encoder is forced to do the semantic work; a
+        # deep decoder would let the predictor solve pixel-recon on its own.
+        if pixel_out_dim > 0:
+            self.pixel_proj = nn.Linear(predictor_dim, pixel_out_dim)
+        else:
+            self.pixel_proj = None
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -265,13 +282,15 @@ class JEPAPredictor(nn.Module):
         z_ctx: torch.Tensor,
         masks: torch.Tensor,
         T: int,
-    ) -> torch.Tensor:
+    ):
         """
         z_ctx: (B, T*N, D_enc) — context-encoder patch tokens, all positions.
         masks: (B, T*N)  bool  — True at positions to predict (constant count per row).
         T:     int             — number of frames.
 
-        Returns: (B, n_masked, D_enc) — predictions at the masked positions only.
+        Returns: (B, n_masked, D_enc) — feature predictions at the masked
+        positions only. If pixel_proj is enabled, returns a tuple
+        ``(z_feat, z_pix)`` where ``z_pix`` has shape (B, n_masked, pixel_out_dim).
         """
         B, S, D = z_ctx.shape
         N = self.num_patches
@@ -292,13 +311,19 @@ class JEPAPredictor(nn.Module):
 
         for blk in self.blocks:
             z = blk(z)
-        z = self.norm(z)
-        z = self.proj_out(z)                                                  # (B, T*N, D_enc)
+        z = self.norm(z)                                                      # (B, T*N, P)
+        z_feat = self.proj_out(z)                                             # (B, T*N, D_enc)
 
         # Gather predictions at masked positions only. masks has fixed count
         # per row, so the reshape is well-defined.
         n_masked = int(masks[0].sum().item())
-        return z[masks].reshape(B, n_masked, D)
+        z_feat_at_mask = z_feat[masks].reshape(B, n_masked, D)
+
+        if self.pixel_proj is None:
+            return z_feat_at_mask
+        z_pix = self.pixel_proj(z)                                            # (B, T*N, pixel_out_dim)
+        z_pix_at_mask = z_pix[masks].reshape(B, n_masked, self.pixel_out_dim)
+        return z_feat_at_mask, z_pix_at_mask
 
 
 class VJEPA(nn.Module):
@@ -326,6 +351,18 @@ class VJEPA(nn.Module):
         mask_ratio: float = 0.75,
         mask_n_blocks: int = 3,
         tubelet_size: int = 1,
+        n_masks: int = 1,
+        mask_sampler: str = "block3d",
+        loss_type: str = "smooth_l1_lnboth",
+        n_long_blocks: int = 2,
+        long_scale: float = 0.85,
+        n_short_blocks: int = 8,
+        short_scale: float = 0.15,
+        aspect_min: float = 1.0,
+        aspect_max: float = 1.5,
+        temporal_tube_fraction: float = 0.0,
+        pixel_weight: float = 0.5,
+        patch_size: int = 16,
     ) -> None:
         super().__init__()
         if num_frames < 2:
@@ -336,6 +373,22 @@ class VJEPA(nn.Module):
             raise ValueError(f"tubelet_size must be >= 1; got {tubelet_size}")
         if tubelet_size > 1 and num_frames % tubelet_size != 0:
             raise ValueError(f"num_frames {num_frames} must be divisible by tubelet_size {tubelet_size}")
+        if n_masks < 1:
+            raise ValueError(f"n_masks must be >= 1; got {n_masks}")
+        if mask_sampler not in ("block3d", "vjepa", "vjepa_st", "tube_block_v7"):
+            raise ValueError(
+                f"mask_sampler must be one of 'block3d','vjepa','vjepa_st','tube_block_v7'; got {mask_sampler}"
+            )
+        if loss_type not in ("smooth_l1_lnboth", "l1_lntarget", "jepa_pixel"):
+            raise ValueError(
+                f"loss_type must be 'smooth_l1_lnboth', 'l1_lntarget' or 'jepa_pixel'; got {loss_type}"
+            )
+        if mask_sampler == "block3d" and n_masks != 1:
+            raise ValueError("mask_sampler='block3d' supports only n_masks=1")
+        if mask_sampler == "tube_block_v7" and n_masks != 1:
+            raise ValueError("mask_sampler='tube_block_v7' supports only n_masks=1")
+        if not 0.0 <= temporal_tube_fraction <= 1.0:
+            raise ValueError(f"temporal_tube_fraction must be in [0,1]; got {temporal_tube_fraction}")
 
         self.num_frames = num_frames
         self.tubelet_size = tubelet_size
@@ -343,6 +396,18 @@ class VJEPA(nn.Module):
         self.loss_beta = loss_beta
         self.mask_ratio = mask_ratio
         self.mask_n_blocks = mask_n_blocks
+        self.n_masks = n_masks
+        self.mask_sampler = mask_sampler
+        self.loss_type = loss_type
+        self.n_long_blocks = n_long_blocks
+        self.long_scale = long_scale
+        self.n_short_blocks = n_short_blocks
+        self.short_scale = short_scale
+        self.aspect_min = aspect_min
+        self.aspect_max = aspect_max
+        self.temporal_tube_fraction = temporal_tube_fraction
+        self.pixel_weight = pixel_weight
+        self.patch_size = patch_size
 
         enc_kwargs = dict(
             variant=variant,
@@ -368,6 +433,12 @@ class VJEPA(nn.Module):
         # In tubelet mode the mask grid spans T_tok temporal slices, not T frames.
         self.n_masked = int(round(mask_ratio * self.t_tokens * num_patches))
 
+        # v7 hybrid: enable pixel head when loss_type asks for it. Output is per
+        # tubelet: 3 channels * tubelet_size frames * patch_size^2 spatial.
+        self.pixel_out_dim = (
+            3 * tubelet_size * patch_size * patch_size if loss_type == "jepa_pixel" else 0
+        )
+
         self.predictor = JEPAPredictor(
             encoder_dim=encoder_dim,
             predictor_dim=predictor_dim,
@@ -375,19 +446,156 @@ class VJEPA(nn.Module):
             num_heads=predictor_heads,
             num_patches=num_patches,
             max_frames=self.t_tokens,
+            pixel_out_dim=self.pixel_out_dim,
         )
 
+    def _sample_vjepa_masks(self, B: int, T_tok: int, device: torch.device, M_override: int = -1) -> torch.Tensor:
+        """V-JEPA 1 multi-block 3D masks. Returns (B, M, T_tok*N) bool,
+        exactly self.n_masked True per row.
+
+        Each of the M masks per clip is the union of `n_long_blocks` long-range
+        tubes (spatial area fraction `long_scale / n_long_blocks` of the grid)
+        and `n_short_blocks` short-range tubes (spatial area fraction
+        `short_scale / n_short_blocks`). All tubes span the full T_tok dim
+        (lifted across every time slice) — full-temporal tubes per the V-JEPA
+        1 default. Mask coverage is then trimmed/padded to exactly
+        `self.n_masked` positions per row so the predictor can batch-gather
+        without ragged tensors.
+
+        `M_override` lets the `vjepa_st` dispatcher request a subset of the M
+        masks (the rest filled by `_sample_temporal_tube_masks`).
+        """
+        grid = self.grid
+        N = grid * grid
+        target = self.n_masked
+        M = self.n_masks if M_override < 0 else M_override
+        n_long = self.n_long_blocks
+        n_short = self.n_short_blocks
+        long_area = max(1, int((self.long_scale / max(1, n_long)) * N)) if n_long > 0 else 0
+        short_area = max(1, int((self.short_scale / max(1, n_short)) * N)) if n_short > 0 else 0
+        a_lo, a_hi = self.aspect_min, self.aspect_max
+
+        masks = torch.zeros(B, M, T_tok, grid, grid, dtype=torch.bool)
+        for b in range(B):
+            for m in range(M):
+                m3d = torch.zeros(T_tok, grid, grid, dtype=torch.bool)
+                for area, count in ((long_area, n_long), (short_area, n_short)):
+                    if area <= 0 or count <= 0:
+                        continue
+                    for _ in range(count):
+                        aspect = float(torch.empty(1).uniform_(a_lo, a_hi).item())
+                        bh = max(1, min(grid, round((area * aspect) ** 0.5)))
+                        bw = max(1, min(grid, round(area / max(1, bh))))
+                        top = int(torch.randint(0, max(1, grid - bh + 1), (1,)).item())
+                        left = int(torch.randint(0, max(1, grid - bw + 1), (1,)).item())
+                        m3d[:, top:top + bh, left:left + bw] = True
+                masks[b, m] = m3d
+
+        flat = masks.view(B * M, T_tok * N).to(device)
+        rand = torch.rand(B * M, T_tok * N, device=device)
+        score = flat.float() * 2.0 + rand
+        _, sorted_idx = torch.sort(score, dim=1, descending=True)
+        out = torch.zeros(B * M, T_tok * N, dtype=torch.bool, device=device)
+        rows = torch.arange(B * M, device=device).unsqueeze(1).expand(-1, target)
+        out[rows, sorted_idx[:, :target]] = True
+        return out.reshape(B, M, T_tok * N)
+
+    def _sample_temporal_tube_masks(self, B: int, T_tok: int, M: int, device: torch.device) -> torch.Tensor:
+        """V-JEPA 2-style temporal tubes. For each (b, m), pick a random T_tok
+        slice and mark its full spatial extent as True; trim/pad to exactly
+        `self.n_masked` True per row. Returns (B, M, T_tok*N) bool.
+
+        At T_tok=2 (our setting), this is binary: mask t=0 OR mask t=1. The
+        predictor must reconstruct one frame's-worth of features from the
+        other — the cleanest motion supervision possible given num_frames=4.
+        Trim/pad ensures a fixed mask budget so we can batch-gather alongside
+        the spatial-tube masks in `_sample_st_masks`.
+        """
+        grid = self.grid
+        N = grid * grid
+        target = self.n_masked
+
+        masks = torch.zeros(B, M, T_tok, grid, grid, dtype=torch.bool)
+        for b in range(B):
+            for m in range(M):
+                t_idx = int(torch.randint(0, T_tok, (1,)).item())
+                masks[b, m, t_idx] = True
+
+        flat = masks.view(B * M, T_tok * N).to(device)
+        rand = torch.rand(B * M, T_tok * N, device=device)
+        score = flat.float() * 2.0 + rand
+        _, sorted_idx = torch.sort(score, dim=1, descending=True)
+        out = torch.zeros(B * M, T_tok * N, dtype=torch.bool, device=device)
+        rows = torch.arange(B * M, device=device).unsqueeze(1).expand(-1, target)
+        out[rows, sorted_idx[:, :target]] = True
+        return out.reshape(B, M, T_tok * N)
+
+    def _sample_st_masks(self, B: int, T_tok: int, device: torch.device) -> torch.Tensor:
+        """Hybrid V-JEPA-1 spatial tubes + V-JEPA-2 temporal tubes. Splits
+        `self.n_masks` into n_spatial = round(M * (1 - temporal_tube_fraction))
+        spatial-tube masks and n_temporal = M - n_spatial temporal-tube masks.
+        Returns (B, M, T_tok*N) bool.
+        """
+        M = self.n_masks
+        n_spatial = max(0, int(round(M * (1.0 - self.temporal_tube_fraction))))
+        n_temporal = M - n_spatial
+        parts = []
+        if n_spatial > 0:
+            parts.append(self._sample_vjepa_masks(B, T_tok, device, M_override=n_spatial))
+        if n_temporal > 0:
+            parts.append(self._sample_temporal_tube_masks(B, T_tok, n_temporal, device))
+        return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+
+    def _sample_tube_block_v7(self, B: int, T_tok: int, device: torch.device) -> torch.Tensor:
+        """v7 sampler: M=1 large rectangular tube, applied to every T_tok slice.
+
+        For each clip, sample one block (bh, bw) in (H_p, W_p) covering ~mask_ratio
+        of the spatial grid, then lift it across all T_tok slices. The same spatial
+        pattern across time is the canonical V-JEPA tube semantics: visible tokens
+        are sparse (~10% of 196 spatial), so the predictor cannot interpolate from
+        spatial neighbours and must rely on motion / shape priors learned by the
+        encoder. Trim/pad to exactly self.n_masked True per row so batch-gather works.
+        Returns (B, 1, T_tok*N).
+        """
+        grid = self.grid
+        N = grid * grid
+        target = self.n_masked
+        # Solve bh * bw >= round(mask_ratio * N), keep aspect roughly square.
+        spatial_target = max(1, int(round(self.mask_ratio * N)))
+
+        masks = torch.zeros(B, T_tok, grid, grid, dtype=torch.bool)
+        for b in range(B):
+            # Sample spatial block: side >= ceil(sqrt(spatial_target)), then pad
+            # the longer dim until area >= spatial_target.
+            side_lo = int(math.ceil(spatial_target ** 0.5))
+            bh = int(torch.randint(side_lo, grid + 1, (1,)).item())
+            bw = int(torch.randint(side_lo, grid + 1, (1,)).item())
+            if bh * bw < spatial_target:
+                bw = min(grid, max(bw, math.ceil(spatial_target / bh)))
+            top = int(torch.randint(0, grid - bh + 1, (1,)).item())
+            left = int(torch.randint(0, grid - bw + 1, (1,)).item())
+            spatial_mask = torch.zeros(grid, grid, dtype=torch.bool)
+            spatial_mask[top:top + bh, left:left + bw] = True
+            masks[b] = spatial_mask.unsqueeze(0).expand(T_tok, -1, -1)
+
+        flat = masks.view(B, T_tok * N).to(device)
+        rand = torch.rand(B, T_tok * N, device=device)
+        score = flat.float() * 2.0 + rand
+        _, sorted_idx = torch.sort(score, dim=1, descending=True)
+        out = torch.zeros(B, T_tok * N, dtype=torch.bool, device=device)
+        rows = torch.arange(B, device=device).unsqueeze(1).expand(-1, target)
+        out[rows, sorted_idx[:, :target]] = True
+        return out.unsqueeze(1)  # (B, 1, T_tok*N)
+
     def _sample_block_masks(self, B: int, T_tok: int, device: torch.device) -> torch.Tensor:
-        """Per-sample block masks over the (T_tok, H, W) token grid, trimmed/
+        """Per-sample 3D block masks over the (T_tok, H, W) token grid, trimmed/
         padded to exactly self.n_masked True positions. Returns (B, T_tok*N).
 
-        Tier-1 (tubelet=1): 2D rectangles in (H, W) lifted across all T frames
-        — same spatial holes appear in every frame. Forces spatial inpainting,
-        but a holey frame can be filled trivially from neighbouring frames.
-
-        Tier-2 (tubelet>1): 3D rectangles (Δt × Δh × Δw) sampled in the
-        (T_tok, H, W) grid — partial-temporal blocks force the predictor to
-        reason temporally instead of inpainting from the unmasked time slice.
+        3D blocks (Δt × Δh × Δw) sampled in the (T_tok, H, W) grid for both
+        Tier-1 (T_tok=num_frames, tubelet=1) and Tier-2 (T_tok=num_frames/tubelet,
+        tubelet>1). Partial-temporal blocks force the predictor to reason
+        temporally instead of inpainting from neighbouring time slices — required
+        for SSv2 where labels are direction/motion-sensitive.
         """
         grid = self.grid
         N = grid * grid
@@ -398,40 +606,24 @@ class VJEPA(nn.Module):
 
         masks_grid = torch.zeros(B, T_tok, grid, grid, dtype=torch.bool)
         for b in range(B):
-            if self.tubelet_size == 1:
-                # 2D mask lifted across all temporal positions.
-                mask_hw = torch.zeros(grid, grid, dtype=torch.bool)
-                attempts = 0
-                while mask_hw.sum().item() * T_tok < target and attempts < 32:
-                    attempts += 1
-                    area_frac = ratio / max(1, n_blocks)
-                    area = max(1, int(area_frac * N))
-                    aspect = float(torch.empty(1).uniform_(0.5, 2.0).item())
-                    bh = max(1, min(grid, round((area * aspect) ** 0.5)))
-                    bw = max(1, min(grid, round(area / max(1, bh))))
-                    top = int(torch.randint(0, grid - bh + 1, (1,)).item())
-                    left = int(torch.randint(0, grid - bw + 1, (1,)).item())
-                    mask_hw[top:top + bh, left:left + bw] = True
-                masks_grid[b] = mask_hw.unsqueeze(0).expand(T_tok, -1, -1)
-            else:
-                # 3D blocks: Δt sampled in [1, T_tok], Δh×Δw drawn so the
-                # spatial slice has area ~ ratio * N / n_blocks. Stack blocks
-                # until the cumulative mask reaches `target`.
-                m3d = torch.zeros(T_tok, grid, grid, dtype=torch.bool)
-                attempts = 0
-                while m3d.sum().item() < target and attempts < 64:
-                    attempts += 1
-                    area_frac = ratio / max(1, n_blocks)
-                    area = max(1, int(area_frac * N))
-                    aspect = float(torch.empty(1).uniform_(0.5, 2.0).item())
-                    bh = max(1, min(grid, round((area * aspect) ** 0.5)))
-                    bw = max(1, min(grid, round(area / max(1, bh))))
-                    bt = int(torch.randint(1, T_tok + 1, (1,)).item())
-                    top = int(torch.randint(0, grid - bh + 1, (1,)).item())
-                    left = int(torch.randint(0, grid - bw + 1, (1,)).item())
-                    t0 = int(torch.randint(0, T_tok - bt + 1, (1,)).item())
-                    m3d[t0:t0 + bt, top:top + bh, left:left + bw] = True
-                masks_grid[b] = m3d
+            # 3D blocks: Δt sampled in [1, T_tok], Δh×Δw drawn so the spatial
+            # slice has area ~ ratio * N / n_blocks. Stack blocks until the
+            # cumulative mask reaches `target`.
+            m3d = torch.zeros(T_tok, grid, grid, dtype=torch.bool)
+            attempts = 0
+            while m3d.sum().item() < target and attempts < 64:
+                attempts += 1
+                area_frac = ratio / max(1, n_blocks)
+                area = max(1, int(area_frac * N))
+                aspect = float(torch.empty(1).uniform_(0.5, 2.0).item())
+                bh = max(1, min(grid, round((area * aspect) ** 0.5)))
+                bw = max(1, min(grid, round(area / max(1, bh))))
+                bt = int(torch.randint(1, T_tok + 1, (1,)).item())
+                top = int(torch.randint(0, grid - bh + 1, (1,)).item())
+                left = int(torch.randint(0, grid - bw + 1, (1,)).item())
+                t0 = int(torch.randint(0, T_tok - bt + 1, (1,)).item())
+                m3d[t0:t0 + bt, top:top + bh, left:left + bw] = True
+            masks_grid[b] = m3d
 
         masks_flat = masks_grid.view(B, total).to(device)
 
@@ -473,23 +665,97 @@ class VJEPA(nn.Module):
                 z_tgt_all = self.target_encoder(clip)
                 z_tgt = z_tgt_all[:, 1:, :]
 
-        # Sample block masks: (B, T_tok*N), exactly self.n_masked True per row.
-        masks = self._sample_block_masks(B, T_tok, device)
+        # Sample masks: (B, M, T_tok*N) bool, exactly self.n_masked True per row.
+        if self.mask_sampler == "vjepa":
+            masks_all = self._sample_vjepa_masks(B, T_tok, device)
+        elif self.mask_sampler == "vjepa_st":
+            masks_all = self._sample_st_masks(B, T_tok, device)
+        elif self.mask_sampler == "tube_block_v7":
+            masks_all = self._sample_tube_block_v7(B, T_tok, device)
+        else:
+            masks_all = self._sample_block_masks(B, T_tok, device).unsqueeze(1)
 
-        z_pred = self.predictor(z_ctx, masks, T_tok)                          # (B, n_masked, D)
-        z_target = z_tgt[masks].reshape(B, self.n_masked, D)                  # (B, n_masked, D)
+        # Pre-compute target LN once over the full grid for recipes that use
+        # global per-token LN; legacy smooth_l1_lnboth LN-aligns the gathered
+        # subset per mask instead.
+        if self.loss_type in ("l1_lntarget", "jepa_pixel"):
+            z_tgt_full_n = F.layer_norm(z_tgt, (D,)).detach()                 # (B, T_tok*N, D)
+        else:
+            z_tgt_full_n = None
 
-        # Parameter-free LayerNorm on both sides for scale-invariant matching.
-        z_pred_n = F.layer_norm(z_pred, (D,))
-        z_target_n = F.layer_norm(z_target, (D,))
+        # Pre-compute pixel target patches (B, T_tok*N, pixel_out_dim) when the
+        # hybrid v7 recipe is active. Token order matches Conv3d-tubelet output:
+        # [t=0,h=0,w=0], [t=0,h=0,w=1], ..., [t=T_tok-1,h=H_p-1,w=W_p-1].
+        if self.loss_type == "jepa_pixel":
+            ts = self.tubelet_size
+            P = self.patch_size
+            H_p = self.grid
+            W_p = self.grid
+            # (B, T, C, H, W) -> (B, T_tok, ts, C, H_p, P, W_p, P)
+            rgb = clip.reshape(B, T_tok, ts, C, H_p, P, W_p, P)
+            # -> (B, T_tok, H_p, W_p, ts, P, P, C)
+            rgb = rgb.permute(0, 1, 4, 6, 2, 5, 7, 3).contiguous()
+            # -> (B, T_tok*N, ts*P*P*C)
+            rgb = rgb.flatten(4).reshape(B, T_tok * N, ts * P * P * C)
+            mean = rgb.mean(-1, keepdim=True)
+            var = rgb.var(-1, keepdim=True, unbiased=False)
+            rgb_n_full = ((rgb - mean) / (var + 1e-6).sqrt()).detach()
+        else:
+            rgb_n_full = None
 
-        loss = F.smooth_l1_loss(z_pred_n, z_target_n.detach(), beta=self.loss_beta)
+        losses_total, losses_jepa, losses_pix = [], [], []
+        cos_sims, target_stds = [], []
+        for m in range(self.n_masks):
+            mask_m = masks_all[:, m]                                          # (B, T_tok*N)
+            pred_out = self.predictor(z_ctx, mask_m, T_tok)
+            if self.loss_type == "jepa_pixel":
+                z_pred, z_pix = pred_out
+            else:
+                z_pred = pred_out
+                z_pix = None
 
-        with torch.no_grad():
-            cos_sim = F.cosine_similarity(z_pred_n, z_target_n, dim=-1).mean()
-            target_std = z_target_n.std(dim=0).mean()
+            if self.loss_type == "smooth_l1_lnboth":
+                z_target = z_tgt[mask_m].reshape(B, self.n_masked, D)
+                z_pred_n = F.layer_norm(z_pred, (D,))
+                z_target_n = F.layer_norm(z_target, (D,))
+                loss_jepa_m = F.smooth_l1_loss(z_pred_n, z_target_n.detach(), beta=self.loss_beta)
+                with torch.no_grad():
+                    cos_m = F.cosine_similarity(z_pred_n, z_target_n, dim=-1).mean()
+                    tgt_std_m = z_target_n.std(dim=0).mean()
+            else:  # l1_lntarget OR jepa_pixel — both use pre-computed LN target
+                z_target_n = z_tgt_full_n[mask_m].reshape(B, self.n_masked, D)
+                loss_jepa_m = F.l1_loss(z_pred, z_target_n)
+                with torch.no_grad():
+                    cos_m = F.cosine_similarity(z_pred, z_target_n, dim=-1).mean()
+                    tgt_std_m = z_target_n.std(dim=0).mean()
 
-        return {"loss": loss, "cos_sim": cos_sim.detach(), "target_std": target_std.detach()}
+            if self.loss_type == "jepa_pixel":
+                rgb_target = rgb_n_full[mask_m].reshape(B, self.n_masked, self.pixel_out_dim)
+                loss_pix_m = F.mse_loss(z_pix, rgb_target)
+                loss_total_m = loss_jepa_m + self.pixel_weight * loss_pix_m
+            else:
+                loss_pix_m = torch.zeros((), device=device)
+                loss_total_m = loss_jepa_m
+
+            losses_total.append(loss_total_m)
+            losses_jepa.append(loss_jepa_m)
+            losses_pix.append(loss_pix_m)
+            cos_sims.append(cos_m)
+            target_stds.append(tgt_std_m)
+
+        loss = torch.stack(losses_total).mean()
+        loss_jepa = torch.stack(losses_jepa).mean().detach()
+        loss_pix = torch.stack(losses_pix).mean().detach()
+        cos_sim = torch.stack(cos_sims).mean().detach()
+        target_std = torch.stack(target_stds).mean().detach()
+
+        return {
+            "loss": loss,
+            "loss_jepa": loss_jepa,
+            "loss_pix": loss_pix,
+            "cos_sim": cos_sim,
+            "target_std": target_std,
+        }
 
     @torch.no_grad()
     def ema_step(self, momentum: float) -> None:

@@ -1,0 +1,57 @@
+# @package _global_
+# Stage 1 — V-JEPA Recipe v3, Phase A.
+# Entry point: `python src/pretrain_vjepa.py experiment=vjepa_pretrain_v3a`
+#
+# Two surgical changes vs vjepa_pretrain_tier2 (no architecture change):
+#   1. 3D block masks for both Tier-1 and Tier-2 paths in vjepa.py
+#      (the old Tier-1 special case lifted a 2D mask across all T frames,
+#      letting the model solve the task by per-frame inpainting and ignoring
+#      motion entirely — fatal for SSv2). For this config (tubelet=2) the
+#      change is a no-op at the masking layer; we still flip the global path.
+#   2. `vjepa.temporal_jitter: true` — replaces the deterministic linspace
+#      frame sampler with strided random sampling (stride ∈ {1,2,4}, random
+#      start). Each epoch sees different temporal windows of the same video.
+#      Fine-tune / eval / submission paths keep the deterministic sampler.
+#
+# Reduced epoch count: ~25 epochs is a Phase-A diagnostic — clear pass
+# criterion is probe ≥ 0.12 real val (vs current 0.096 ceiling) when the
+# resulting ckpt is dropped into exp9_vjepa_attnpool_tier2 with the
+# checkpoint_path overridden on the CLI.
+
+vjepa:
+  variant: vit_s_16
+  image_size: 224
+  patch_size: 16
+  num_frames: 4
+  tubelet_size: 2
+  predictor_dim: 256
+  predictor_depth: 6
+  predictor_heads: 8
+  mask_ratio: 0.75
+  mask_n_blocks: 3
+  temporal_jitter: true
+
+training:
+  batch_size: 256
+  base_lr: 7.5e-5               # effective lr = base_lr * batch_size / 256
+  final_lr: 1.0e-6
+  weight_decay: 0.05
+  warmup_epochs: 4              # scaled down for the shorter run
+  epochs: 25
+  amp: true
+  num_workers: 8
+  grad_clip: 3.0
+  ema_momentum_start: 0.998
+  ema_momentum_end: 1.0
+  loss_beta: 2.0
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1_v3a.pt
+  device: cuda
+  max_nonfinite_streak: 50
+  early_stop_patience: 25
+  early_stop_min_delta: 1.0e-4
+  early_stop_min_epochs: 25     # match epochs — no early stop in diagnostic
+
+wandb:
+  enabled: true
+  run_name: vjepa_stage1_v3a
+  tags: [track1, stage1, vjepa, v3, phase-a, tubelet, spacetime, temporal-jitter]

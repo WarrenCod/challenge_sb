@@ -1,0 +1,81 @@
+# @package _global_
+# Stage 1 — V-JEPA SOTA-aligned port (Recipe v4).
+# Entry point: `python src/pretrain_vjepa.py experiment=vjepa_pretrain_v4`
+#
+# Anchored on V-JEPA 1 (Bardes et al. 2024). Five surgical changes vs Tier-2/v3a:
+#   1. Multi-mask M=4 (`n_masks: 4`). Encoder fwd runs once per clip, predictor
+#      runs M times against M distinct masks. ~M× SSL signal per encoder step.
+#   2. V-JEPA mask sampler (`mask_sampler: vjepa`): per mask, union of 2 long-
+#      range tubes (spatial scale 0.85) + 8 short-range tubes (spatial scale
+#      0.15), all lifted across the full T_tok dim (full-temporal tubes).
+#      Trim to a fixed n_masked positions for batched gather.
+#   3. L1 loss with parameter-free LayerNorm on target only
+#      (`loss_type: l1_lntarget`). Drops the redundant LN on prediction.
+#   4. Bigger predictor: 12 layers × 384 dim × 6 heads (matches encoder dim,
+#      so proj_in/proj_out are effectively identity-shaped).
+#   5. Minimal augmentation (`aug: minimal`): clip-consistent RandomResizedCrop
+#      + ImageNet normalize. No flip (SSv2), no color jitter / grayscale / blur.
+#
+# Architecture: ViT-S/16, tubelet_size=2, num_frames=4 → token grid (2,14,14)
+# = 392 patch tokens per clip. EMA target encoder (0.998 → 1.0 cosine).
+#
+# Stage 2 reuse: pass `training.checkpoint_path=$(pwd)/checkpoints/vjepa_stage1_v4.pt`
+# on the CLI when running `experiment=exp9_vjepa_attnpool_tier2`. No Stage 2
+# config edit needed — the saved encoder dump uses the same key layout.
+#
+# Pass criterion: real-val top-1 ≥ 0.13 with frozen encoder + attnpool head
+# (vs the 0.084-0.096 ceiling from Tier-1/Tier-2 across mean/attn-pool heads).
+
+vjepa:
+  variant: vit_s_16
+  image_size: 224
+  patch_size: 16
+  num_frames: 4
+  tubelet_size: 2
+  predictor_dim: 384
+  predictor_depth: 12
+  predictor_heads: 6
+  mask_ratio: 0.85
+  # New: V-JEPA 1 mask sampler + multi-mask + target-only LN L1
+  n_masks: 4
+  mask_sampler: vjepa
+  loss_type: l1_lntarget
+  n_long_blocks: 2
+  long_scale: 0.85
+  n_short_blocks: 8
+  short_scale: 0.15
+  aspect_min: 1.0
+  aspect_max: 1.5
+  aug: minimal
+
+training:
+  batch_size: 32                # M=4 predictor passes; conservative start
+  base_lr: 6.25e-4              # V-JEPA 1 default; effective = base_lr * batch / 256
+  final_lr: 1.0e-6
+  weight_decay: 0.04
+  warmup_epochs: 10
+  epochs: 200
+  amp: true
+  num_workers: 8
+  grad_clip: 3.0
+  ema_momentum_start: 0.998
+  ema_momentum_end: 1.0
+  loss_beta: 2.0                # unused under loss_type=l1_lntarget; kept for cfg-hash stability
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1_v4.pt
+  device: cuda
+  max_nonfinite_streak: 50
+  early_stop_patience: 30
+  early_stop_min_delta: 1.0e-4
+  early_stop_min_epochs: 80
+
+wandb:
+  enabled: true
+  run_name: vjepa_stage1_v4
+  tags: [track1, stage1, vjepa, v4, sota-port, multimask, tubelet]
+  notes: |
+    V-JEPA 1 SOTA port. ViT-S/16 + tubelet=2, predictor 12L*384d*6h.
+    Multi-mask M=4 (long+short tubes, full-temporal). L1 + target-only LN.
+    RRC-only aug. Anchor: V-JEPA 1 paper, adapted to 4-frame 224x224 clips.
+    arch: clip(B,4,3,224,224) -> tubelet(2,14,14)=392 tokens
+        ctx_enc -> z_ctx -+
+        tgt_enc -> z_tgt  +-> predictor(M=4 masks) -> L1(LN(z_tgt))

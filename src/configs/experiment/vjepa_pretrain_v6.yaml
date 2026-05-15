@@ -1,0 +1,92 @@
+# @package _global_
+# Stage 1 — V-JEPA v6 (plateau-breaker on top of v5).
+# Entry point: `python src/pretrain_vjepa.py experiment=vjepa_pretrain_v6`
+#
+# v5 plateaued at cos~0.92, loss~0.28 from epoch 16-35: predictor matched the
+# target almost perfectly via the appearance shortcut. Diagnosis: the masked-
+# prediction task is too easy and the EMA target co-moves with the predictor.
+# v6 attacks both, structurally:
+#
+#   1. tubelet_size: 2 -> 1
+#      T_tok = 4 (was 2). Temporal-tube masking now removes 1-of-4 time slices
+#      instead of 1-of-2; the predictor can no longer interpolate linearly
+#      between two visible halves of the clip. Doubles token count (392 -> 784).
+#   2. temporal_tube_fraction: 0.30 -> 0.50
+#      Half the M masks per clip are temporal tubes (was 30%). v5 left 70% of
+#      batches as spatial tubes where appearance-only inpainting wins.
+#   3. predictor_depth: 12 -> 8
+#      Capacity bottleneck on the predictor pushes work onto the encoder, which
+#      is the bottleneck per the 0.084-0.096 attnpool ceiling. Depth 8 is the
+#      middle ground (paper's small variant is 6, full V-JEPA-1 is 12).
+#   4. ema_momentum_start: 0.99 -> 0.996
+#      v5 dropped this from 0.998 -> 0.99; on 45k clips that lets the target
+#      track the predictor and the gradient collapses. 0.996 holds the target
+#      steady enough for the predictor to have a real distance to close.
+#   5. n_long_blocks 2 -> 3, short_scale 0.15 -> 0.20
+#      Bigger contiguous spatial-mask regions so the spatial-tube portion is
+#      also harder to inpaint from neighbours.
+#   6. n_masks: 4 -> 2, batch_size 32 -> 16, base_lr 6.25e-4 -> 4.5e-4
+#      Token count doubled; halve batch + halve mask count + sqrt-scale LR to
+#      keep memory <24 GiB and per-step cost ~1.7x v5. 200 epochs targets ~60 h.
+#
+# Pass criterion (same gate as v5): real-val top-1 >= 0.105 with frozen encoder
+# + attnpool head via experiment=exp9_vjepa_probe_v6 + evaluate.py.
+#
+# Stage 2 reuse: pass `training.checkpoint_path=$(pwd)/checkpoints/vjepa_stage1_v6.pt`
+# on the CLI when running `experiment=exp8_vjepa_spacetime` and override
+# `model.spatial.tubelet_size: 1` (the v6 encoder is tubelet=1).
+
+vjepa:
+  variant: vit_s_16
+  image_size: 224
+  patch_size: 16
+  num_frames: 4
+  tubelet_size: 1
+  predictor_dim: 384
+  predictor_depth: 8
+  predictor_heads: 6
+  mask_ratio: 0.85
+  n_masks: 2
+  mask_sampler: vjepa_st
+  temporal_tube_fraction: 0.50
+  loss_type: l1_lntarget
+  n_long_blocks: 3
+  long_scale: 0.85
+  n_short_blocks: 8
+  short_scale: 0.20
+  aspect_min: 1.0
+  aspect_max: 1.5
+  aug: mild
+  temporal_jitter: true
+
+training:
+  batch_size: 16
+  base_lr: 4.5e-4
+  final_lr: 1.0e-6
+  weight_decay: 0.04
+  warmup_epochs: 10
+  epochs: 200
+  amp: true
+  num_workers: 8
+  grad_clip: 3.0
+  ema_momentum_start: 0.996
+  ema_momentum_end: 1.0
+  loss_beta: 2.0
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1_v6.pt
+  device: cuda
+  max_nonfinite_streak: 50
+  early_stop_patience: 30
+  early_stop_min_delta: 1.0e-4
+  early_stop_min_epochs: 60
+
+wandb:
+  enabled: true
+  run_name: vjepa_stage1_v6
+  tags: [track1, stage1, vjepa, v6, plateau-breaker, tubelet1, depth8-predictor]
+  notes: |
+    V-JEPA v6 plateau-breaker. ViT-S/16, tubelet=1 (T_tok=4), predictor 8L*384d*6h.
+    50% temporal tubes + 50% spatial tubes; bigger spatial blocks. EMA 0.996->1.0.
+    Targets the predictor-wins-easily failure mode of v5 (cos plateaued at 0.92).
+    arch: clip(B,4,3,224,224) -> patches(4,14,14)=784 tokens
+        ctx_enc -> z_ctx -+
+        tgt_enc -> z_tgt  +-> predictor(M=2: 1 spatial + 1 temporal mask) -> L1(LN(z_tgt))

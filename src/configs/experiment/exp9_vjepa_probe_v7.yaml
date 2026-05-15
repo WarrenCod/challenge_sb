@@ -1,0 +1,33 @@
+# @package _global_
+# exp9-probe-v7 (Track 1, gate): frozen V-JEPA v7 encoder + attention pool +
+# linear classifier. Pass gate for Stage-2 (exp10_vjepa_v7_spacetime):
+# real-val top-1 >= 0.105 via evaluate.py on the full val_dir (NOT the leaky
+# in-train 80/20 reported by train.py).
+defaults:
+  - override /model: vit_vjepa_attnpool_v7
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 32
+  lr: 1.0e-3
+  llrd: 0.0
+  epochs: 20
+  warmup_epochs: 2
+  weight_decay: 1.0e-4
+  label_smoothing: 0.1
+  mixup_alpha: 0.0
+  strong_clip_aug: false
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema: false
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp9_vjepa_probe_v7.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: exp9_vjepa_probe_v7
+  tags: [track1, diagnostic, vjepa, v7, attn-pool, frozen-encoder, gate, hybrid]

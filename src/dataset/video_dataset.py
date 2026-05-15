@@ -100,6 +100,33 @@ def _pick_frame_indices(num_available: int, num_frames: int) -> List[int]:
     return indices
 
 
+def _pick_frame_indices_strided(num_available: int, num_frames: int) -> List[int]:
+    """
+    Strided random sampling: pick a stride from {1, 2, 4} (largest that fits),
+    then a random start, return num_frames contiguous-at-stride indices.
+
+    Used for SSL pretraining only — fine-tune / eval / submission stay on the
+    deterministic linspace path. Falls back to _pick_frame_indices when no
+    stride fits (very short clips).
+    """
+    if num_available <= 0:
+        raise ValueError("Video has no frames.")
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive.")
+
+    if num_available == 1:
+        return [0] * num_frames
+
+    candidates = [s for s in (1, 2, 4) if s * (num_frames - 1) + 1 <= num_available]
+    if not candidates:
+        return _pick_frame_indices(num_available, num_frames)
+
+    stride = candidates[int(torch.randint(0, len(candidates), (1,)).item())]
+    max_start = num_available - stride * (num_frames - 1) - 1
+    start = int(torch.randint(0, max_start + 1, (1,)).item()) if max_start > 0 else 0
+    return [start + i * stride for i in range(num_frames)]
+
+
 class VideoFrameDataset(Dataset):
     def __init__(
         self,
@@ -108,6 +135,7 @@ class VideoFrameDataset(Dataset):
         transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
         sample_list: Optional[List[Tuple[Path, int]]] = None,
         clip_transform: Optional[Callable[[List[Image.Image]], torch.Tensor]] = None,
+        temporal_sampler: Optional[Callable[[int, int], List[int]]] = None,
     ) -> None:
         """
         Args:
@@ -119,6 +147,9 @@ class VideoFrameDataset(Dataset):
                 tensor directly. Use this for clip-aware augmentations (RandomResizedCrop,
                 ColorJitter, RandAugment) applied identically across frames — required
                 whenever you want temporal coherence under strong aug.
+            temporal_sampler: (num_available, num_frames) -> list of frame indices.
+                Defaults to deterministic linspace. Pass _pick_frame_indices_strided
+                for randomized stride+offset sampling during SSL pretraining.
         """
         if transform is None and clip_transform is None:
             raise ValueError("VideoFrameDataset needs either transform or clip_transform.")
@@ -127,6 +158,7 @@ class VideoFrameDataset(Dataset):
         self.num_frames = num_frames
         self.transform = transform
         self.clip_transform = clip_transform
+        self.temporal_sampler = temporal_sampler or _pick_frame_indices
 
         if sample_list is None:
             self.samples = collect_video_samples(self.root_dir)
@@ -139,7 +171,7 @@ class VideoFrameDataset(Dataset):
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         video_dir, label = self.samples[index]
         frame_paths = _list_frame_paths(video_dir)
-        indices = _pick_frame_indices(len(frame_paths), self.num_frames)
+        indices = self.temporal_sampler(len(frame_paths), self.num_frames)
 
         pil_frames: List[Image.Image] = []
         for frame_index in indices:

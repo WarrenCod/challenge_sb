@@ -1,0 +1,21 @@
+# @package _global_
+# Frozen-encoder probe on V-JEPA v6. Identical to vit_vjepa_attnpool_v5 except
+# tubelet_size=1 (matching the v6 Stage-1 encoder). Used by exp9_vjepa_probe_v6
+# to evaluate the pass-gate (real-val top-1 >= 0.105).
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: vit_mae
+    variant: vit_s_16
+    image_size: 224
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1_v6.pt
+    drop_path: 0.0
+    pool: attn_pool
+    freeze: true
+    tubelet_size: 1
+    num_frames: 4
+  temporal:
+    name: mean_pool
+  classifier:
+    name: linear

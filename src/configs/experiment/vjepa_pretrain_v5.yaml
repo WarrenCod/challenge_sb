@@ -1,0 +1,89 @@
+# @package _global_
+# Stage 1 — V-JEPA SOTA-adapted (Recipe v5).
+# Entry point: `python src/pretrain_vjepa.py experiment=vjepa_pretrain_v5`
+#
+# Anchored on V-JEPA 1 (Bardes et al. 2024) with V-JEPA 2's temporal-tube
+# masking grafted on top. Five surgical changes vs v4:
+#   1. mask_sampler: vjepa -> vjepa_st  (hybrid)
+#      ~70% V-JEPA-1 spatial tubes (long+short, full-temporal) +
+#      ~30% V-JEPA-2 temporal tubes (mask one T_tok slice fully).
+#      Reason: the 9.6% Tier-2 probe ceiling was an "encoder learns appearance,
+#      not motion" symptom; temporal tubes force motion supervision.
+#   2. ema_momentum_start: 0.998 -> 0.99
+#      0.998 holds the target too still on small (~45k clip) data and the
+#      predictor races ahead. 0.99 is V-JEPA 1's published cosine start.
+#   3. temporal_jitter: false -> true
+#      Strided random temporal sampler, ~2-3x effective-data multiplier.
+#   4. aug: minimal -> mild
+#      RRC + clip-consistent ColorJitter (b=.2 c=.2 s=.1 h=.05); no flip
+#      (SSv2 direction-sensitive), no blur, no grayscale. Restores input
+#      diversity that the unusable hflip would have provided.
+#   5. epochs / warmup: 200 / 10 -> 250 / 15
+#      Small dataset benefits from more passes; higher mask diversity wants
+#      a longer warmup.
+#
+# Architecture unchanged: ViT-S/16, tubelet_size=2, num_frames=4 -> token grid
+# (T_tok=2, 14, 14) = 392 patch tokens per clip. EMA target encoder, predictor
+# 12L * 384d * 6h, L1 with target-only LN.
+#
+# Pass criterion: real-val top-1 >= 0.105 with frozen encoder + attnpool head
+# via experiment=exp9_vjepa_probe_v5 + evaluate.py (clears the 0.096 Tier-2
+# attnpool ceiling).
+#
+# Stage 2 reuse: pass `training.checkpoint_path=$(pwd)/checkpoints/vjepa_stage1_v5.pt`
+# on the CLI when running `experiment=exp8_vjepa_spacetime`.
+
+vjepa:
+  variant: vit_s_16
+  image_size: 224
+  patch_size: 16
+  num_frames: 4
+  tubelet_size: 2
+  predictor_dim: 384
+  predictor_depth: 12
+  predictor_heads: 6
+  mask_ratio: 0.85
+  n_masks: 4
+  mask_sampler: vjepa_st
+  temporal_tube_fraction: 0.30
+  loss_type: l1_lntarget
+  n_long_blocks: 2
+  long_scale: 0.85
+  n_short_blocks: 8
+  short_scale: 0.15
+  aspect_min: 1.0
+  aspect_max: 1.5
+  aug: mild
+  temporal_jitter: true
+
+training:
+  batch_size: 32
+  base_lr: 6.25e-4
+  final_lr: 1.0e-6
+  weight_decay: 0.04
+  warmup_epochs: 15
+  epochs: 250
+  amp: true
+  num_workers: 8
+  grad_clip: 3.0
+  ema_momentum_start: 0.99
+  ema_momentum_end: 1.0
+  loss_beta: 2.0
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1_v5.pt
+  device: cuda
+  max_nonfinite_streak: 50
+  early_stop_patience: 30
+  early_stop_min_delta: 1.0e-4
+  early_stop_min_epochs: 80
+
+wandb:
+  enabled: true
+  run_name: vjepa_stage1_v5
+  tags: [track1, stage1, vjepa, v5, sota-adapted, temporal-tubes, hybrid-mask]
+  notes: |
+    V-JEPA SOTA-adapted. ViT-S/16 + tubelet=2, predictor 12L*384d*6h.
+    Hybrid masking: ~70% V-JEPA-1 spatial tubes + ~30% V-JEPA-2 temporal tubes.
+    Mild aug (RRC + ColorJitter, no flip). EMA 0.99->1.0. Temporal jitter on.
+    arch: clip(B,4,3,224,224) -> tubelet(2,14,14)=392 tokens
+        ctx_enc -> z_ctx -+
+        tgt_enc -> z_tgt  +-> predictor(M=4: 3 spatial + 1 temporal mask) -> L1(LN(z_tgt))

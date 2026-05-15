@@ -1,0 +1,32 @@
+# @package _global_
+# exp9-tier1 (Track 1, diagnostic): frozen V-JEPA Tier-1 encoder + linear probe.
+# Mirror of exp9_vjepa_probe_tier2 with the Tier-1 ckpt — separates "tier matters"
+# from "pooling matters" in the post-tier2-probe analysis.
+defaults:
+  - override /model: vit_vjepa_probe_tier1
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 32
+  lr: 1.0e-3
+  llrd: 0.0
+  epochs: 20
+  warmup_epochs: 2
+  weight_decay: 1.0e-4
+  label_smoothing: 0.1
+  mixup_alpha: 0.0
+  strong_clip_aug: false
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema: false
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp9_vjepa_probe_tier1.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: exp9_vjepa_probe_tier1
+  tags: [track1, diagnostic, vjepa, tier1, linear-probe, frozen-encoder]

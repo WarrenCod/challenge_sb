@@ -30,8 +30,8 @@ from torch.amp import autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from dataset.vjepa_dataset import VJEPAClipAug
-from dataset.video_dataset import VideoFrameDataset
+from dataset.vjepa_dataset import VJEPAClipAug, VJEPAClipAugMild, VJEPAClipAugMinimal
+from dataset.video_dataset import VideoFrameDataset, _pick_frame_indices_strided
 from models.vjepa import VJEPA
 from utils import (
     atomic_torch_save,
@@ -98,11 +98,25 @@ def main(cfg: DictConfig) -> None:
 
     # --- data ---
     train_dir = Path(cfg.dataset.train_dir).resolve()
-    aug = VJEPAClipAug(image_size=int(cfg.vjepa.image_size))
+    aug_kind = str(cfg.vjepa.get("aug", "clip"))
+    if aug_kind == "minimal":
+        aug = VJEPAClipAugMinimal(image_size=int(cfg.vjepa.image_size))
+    elif aug_kind == "mild":
+        aug = VJEPAClipAugMild(image_size=int(cfg.vjepa.image_size))
+    elif aug_kind == "clip":
+        aug = VJEPAClipAug(image_size=int(cfg.vjepa.image_size))
+    else:
+        raise ValueError(f"vjepa.aug must be 'clip', 'mild' or 'minimal'; got {aug_kind!r}")
+    temporal_sampler = (
+        _pick_frame_indices_strided
+        if bool(cfg.vjepa.get("temporal_jitter", False))
+        else None
+    )
     dataset = VideoFrameDataset(
         root_dir=train_dir,
         num_frames=int(cfg.vjepa.num_frames),
         clip_transform=aug,
+        temporal_sampler=temporal_sampler,
     )
     if cfg.dataset.get("max_samples") is not None:
         dataset.samples = dataset.samples[: int(cfg.dataset.max_samples)]
@@ -130,6 +144,18 @@ def main(cfg: DictConfig) -> None:
         mask_ratio=float(cfg.vjepa.get("mask_ratio", 0.75)),
         mask_n_blocks=int(cfg.vjepa.get("mask_n_blocks", 3)),
         tubelet_size=int(cfg.vjepa.get("tubelet_size", 1)),
+        n_masks=int(cfg.vjepa.get("n_masks", 1)),
+        mask_sampler=str(cfg.vjepa.get("mask_sampler", "block3d")),
+        loss_type=str(cfg.vjepa.get("loss_type", "smooth_l1_lnboth")),
+        n_long_blocks=int(cfg.vjepa.get("n_long_blocks", 2)),
+        long_scale=float(cfg.vjepa.get("long_scale", 0.85)),
+        n_short_blocks=int(cfg.vjepa.get("n_short_blocks", 8)),
+        short_scale=float(cfg.vjepa.get("short_scale", 0.15)),
+        aspect_min=float(cfg.vjepa.get("aspect_min", 1.0)),
+        aspect_max=float(cfg.vjepa.get("aspect_max", 1.5)),
+        temporal_tube_fraction=float(cfg.vjepa.get("temporal_tube_fraction", 0.0)),
+        pixel_weight=float(cfg.vjepa.get("pixel_weight", 0.5)),
+        patch_size=int(cfg.vjepa.get("patch_size", 16)),
     ).to(device)
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
@@ -212,7 +238,7 @@ def main(cfg: DictConfig) -> None:
     for epoch in range(start_epoch, epochs):
         model.train()
         model.target_encoder.eval()
-        running = {"loss": 0.0, "cos": 0.0, "tgt_std": 0.0}
+        running = {"loss": 0.0, "loss_jepa": 0.0, "loss_pix": 0.0, "cos": 0.0, "tgt_std": 0.0}
         seen = 0
         nonfinite_this_epoch = 0
         t0 = time.time()
@@ -251,17 +277,23 @@ def main(cfg: DictConfig) -> None:
 
             b = clip.shape[0]
             running["loss"] += float(loss.item()) * b
+            running["loss_jepa"] += float(out["loss_jepa"].item()) * b
+            running["loss_pix"] += float(out["loss_pix"].item()) * b
             running["cos"] += float(out["cos_sim"].item()) * b
             running["tgt_std"] += float(out["target_std"].item()) * b
             seen += b
             bar.set_postfix(
                 loss=running["loss"] / max(1, seen),
+                Lj=running["loss_jepa"] / max(1, seen),
+                Lp=running["loss_pix"] / max(1, seen),
                 cos=running["cos"] / max(1, seen),
                 lr=optimizer.param_groups[0]["lr"],
             )
 
         dt = (time.time() - t0) / 60.0
         avg_loss = running["loss"] / max(1, seen) if seen > 0 else float("nan")
+        avg_loss_jepa = running["loss_jepa"] / max(1, seen) if seen > 0 else float("nan")
+        avg_loss_pix = running["loss_pix"] / max(1, seen) if seen > 0 else float("nan")
         avg_cos = running["cos"] / max(1, seen) if seen > 0 else float("nan")
         avg_tgt = running["tgt_std"] / max(1, seen) if seen > 0 else float("nan")
         loss_finite = bool(np.isfinite(avg_loss))
@@ -274,14 +306,17 @@ def main(cfg: DictConfig) -> None:
             epochs_since_improve += 1
 
         print(
-            f"Epoch {epoch + 1}/{epochs} | loss {avg_loss:.4f} | cos {avg_cos:.4f} "
-            f"| tgt_std {avg_tgt:.4f} | {dt:.2f} min "
+            f"Epoch {epoch + 1}/{epochs} | loss {avg_loss:.4f} "
+            f"(L_jepa {avg_loss_jepa:.4f}, L_pix {avg_loss_pix:.4f}) "
+            f"| cos {avg_cos:.4f} | tgt_std {avg_tgt:.4f} | {dt:.2f} min "
             f"| best {best_loss:.4f} (no_improve={epochs_since_improve}) "
             f"| nonfinite {nonfinite_this_epoch}"
         )
         wandb_log(
             {
                 "vjepa/loss": avg_loss,
+                "vjepa/loss_jepa": avg_loss_jepa,
+                "vjepa/loss_pix": avg_loss_pix,
                 "vjepa/cos_sim": avg_cos,
                 "vjepa/target_std": avg_tgt,
                 "vjepa/lr": optimizer.param_groups[0]["lr"],

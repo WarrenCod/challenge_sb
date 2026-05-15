@@ -45,8 +45,10 @@ class ViTMAEEncoder(SpatialEncoder):
         super().__init__()
         if variant not in _VIT_VARIANTS:
             raise ValueError(f"Unknown vit variant {variant}. Options: {list(_VIT_VARIANTS)}")
-        if pool not in ("cls", "tokens", "mean_patches"):
-            raise ValueError(f"pool must be 'cls', 'tokens', or 'mean_patches', got {pool!r}")
+        if pool not in ("cls", "tokens", "mean_patches", "attn_pool"):
+            raise ValueError(
+                f"pool must be 'cls', 'tokens', 'mean_patches', or 'attn_pool', got {pool!r}"
+            )
         if tubelet_size < 1:
             raise ValueError(f"tubelet_size must be >= 1; got {tubelet_size}")
         if tubelet_size > 1 and num_frames % tubelet_size != 0:
@@ -98,6 +100,28 @@ class ViTMAEEncoder(SpatialEncoder):
         if freeze:
             for p in self.parameters():
                 p.requires_grad_(False)
+
+        # attn-pool head is constructed AFTER the freeze loop so its params stay
+        # trainable while the encoder remains frozen. dropout=0 keeps train/eval
+        # behavior identical, matching the rest of the frozen-probe setup.
+        if pool == "attn_pool":
+            self.attn_pool_query = nn.Parameter(torch.zeros(1, 1, v["embed_dim"]))
+            nn.init.trunc_normal_(self.attn_pool_query, std=0.02)
+            self.attn_pool_attn = nn.MultiheadAttention(
+                embed_dim=v["embed_dim"],
+                num_heads=v["num_heads"],
+                dropout=0.0,
+                batch_first=True,
+            )
+            self.attn_pool_norm = nn.LayerNorm(v["embed_dim"])
+
+    def _attn_pool(self, tokens: torch.Tensor) -> torch.Tensor:
+        # tokens: (M, K, D) -> (M, D). One learned query, cross-attends K tokens.
+        M = tokens.shape[0]
+        q = self.attn_pool_query.expand(M, -1, -1)
+        y, _ = self.attn_pool_attn(q, tokens, tokens, need_weights=False)
+        y = self.attn_pool_norm(y + q)
+        return y.squeeze(1)
 
     def _load_mae_checkpoint(self, path: str) -> None:
         ck = torch.load(Path(path).resolve(), map_location="cpu", weights_only=False)
@@ -151,6 +175,9 @@ class ViTMAEEncoder(SpatialEncoder):
             if self.pool == "mean_patches":
                 patches_mean = x[:, 1:, :].mean(dim=1)         # (B*T, D)
                 return patches_mean.view(B, T, self.out_dim)
+            if self.pool == "attn_pool":
+                pooled = self._attn_pool(x)                    # (B*T, D)
+                return pooled.view(B, T, self.out_dim)
             # pool == "tokens"
             return x.view(B, T, 1 + N, self.out_dim)
 
@@ -161,6 +188,12 @@ class ViTMAEEncoder(SpatialEncoder):
             return cls_b.expand(-1, T_out, -1).contiguous()
         if self.pool == "mean_patches":
             return patches.mean(dim=2)                          # (B, T_tok, D)
+        if self.pool == "attn_pool":
+            cls_rep = cls_b.unsqueeze(1).expand(-1, T_out, -1, -1)
+            tokens_per_slice = torch.cat([cls_rep, patches], dim=2)  # (B, T_tok, 1+N, D)
+            tokens_flat = tokens_per_slice.reshape(B * T_out, 1 + N, self.out_dim)
+            pooled = self._attn_pool(tokens_flat)                # (B*T_tok, D)
+            return pooled.view(B, T_out, self.out_dim)
         # pool == "tokens": (B, T_tok, 1+N, D), CLS replicated per slice.
         cls_rep = cls_b.unsqueeze(1).expand(-1, T_out, -1, -1)
         return torch.cat([cls_rep, patches], dim=2)

@@ -1,0 +1,84 @@
+# @package _global_
+# Stage 1 — V-JEPA v7 (hybrid V-JEPA + pixel-MAE).
+# Entry point: `python src/pretrain_vjepa.py experiment=vjepa_pretrain_v7`
+#
+# v3a→v6 all collapsed to an appearance shortcut: probe ceiling 0.084-0.096 real val
+# despite cos→0.95, loss→0.16. Diagnosis: pure feature-prediction with co-evolving
+# EMA teacher + 4-frame clips + ≤50% temporal tubes lets the predictor solve masked
+# prediction by interpolating from spatially adjacent visible patches. The encoder
+# never has to learn motion priors.
+#
+# v7 redesign:
+#   1. Hybrid loss `jepa_pixel`: L = L_jepa + 0.5 * L_pixel
+#      Pixel reconstruction (per-patch-LN RGB, MSE) is non-gameable — no co-evolution
+#      can collapse it. Anchors low-level features while V-JEPA provides semantics.
+#   2. tubelet_size=2 (T_tok=2, 392 tokens). v6's tubelet=1 doubled token count
+#      without doubling predictor capacity (capacity inversion); back to tubelet=2.
+#   3. tube_block_v7 mask sampler: M=1, single 90% rectangular block lifted across
+#      all T_tok slices. Visible ≈ 40 tokens per clip — too sparse for spatial
+#      interpolation; predictor must use motion / shape priors.
+#   4. predictor depth=6, dim=384 (matches encoder dim, half encoder depth — not too
+#      deep so it doesn't over-solve; not too shallow so encoder still gets gradient).
+#   5. EMA momentum 0.999 → 1.0 (highest of any v): steady target stops predictor
+#      from chasing teacher drift.
+#   6. batch_size=32 (392 tokens × 32 = same activation footprint as v6's 784 × 16).
+#      base_lr=1.0e-3 → effective 1.25e-4 (script applies base_lr * batch / 256).
+#
+# Stage-2 reuse: experiment=exp10_vjepa_v7_spacetime loads
+# checkpoints/vjepa_stage1_v7.pt with tubelet_size=2.
+#
+# Pass criterion (probe gate via experiment=exp9_vjepa_probe_v7 + evaluate.py):
+#   ep 25 ≥ 0.12 real val | ep 50 ≥ 0.18 | ep 100 ≥ 0.28
+# If a gate misses, kill and revisit.
+
+vjepa:
+  variant: vit_s_16
+  image_size: 224
+  patch_size: 16
+  num_frames: 4
+  tubelet_size: 2
+  predictor_dim: 384
+  predictor_depth: 6
+  predictor_heads: 6
+  mask_ratio: 0.90
+  n_masks: 1
+  mask_sampler: tube_block_v7
+  loss_type: jepa_pixel
+  pixel_weight: 0.5
+  aug: mild
+  temporal_jitter: true
+
+training:
+  batch_size: 32
+  base_lr: 1.0e-3
+  final_lr: 1.0e-6
+  weight_decay: 0.04
+  warmup_epochs: 15
+  epochs: 200
+  amp: true
+  num_workers: 8
+  grad_clip: 3.0
+  ema_momentum_start: 0.999
+  ema_momentum_end: 1.0
+  loss_beta: 2.0
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1_v7.pt
+  device: cuda
+  max_nonfinite_streak: 50
+  early_stop_patience: 30
+  early_stop_min_delta: 1.0e-4
+  early_stop_min_epochs: 60
+
+wandb:
+  enabled: true
+  run_name: vjepa_stage1_v7
+  tags: [track1, stage1, vjepa, v7, hybrid, pixel-mae, tubelet2, tube-mask-90]
+  notes: |
+    V-JEPA v7 hybrid V-JEPA + pixel-MAE. ViT-S/16, tubelet=2 (T_tok=2, 392 tokens).
+    Predictor 6L*384d*6h. Single tube-block mask 90%, lifted across both T_tok slices.
+    Loss = L1(LN(z_tgt)[mask]) + 0.5 * MSE(LN_per_patch(rgb)[mask]).
+    EMA 0.999->1.0. batch=32, eff_lr=1.25e-4, 200 ep.
+    Targets the appearance-shortcut collapse that capped v3a-v6 probes at 0.096.
+    arch: clip(B,4,3,224,224) -> Conv3d-tubelet -> 392 patch tokens
+        ctx_enc(masked 90%) -> z_ctx -+
+                                       +-> predictor -+-> proj_out -> L1 vs LN(z_tgt)[mask]
+        tgt_enc(full) ----> z_tgt ----+               +-> pixel_proj -> MSE vs LN(rgb)[mask]
