@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from models.base import SpatialEncoder
-from models.mae_vit import PatchEmbed, _sincos_2d_posembed, _sincos_3d_posembed
+from models._vit_utils import PatchEmbed, _sincos_2d_posembed, _sincos_3d_posembed
 from models.vjepa import TubeletPatchEmbed
 from timm.models.vision_transformer import Block
 

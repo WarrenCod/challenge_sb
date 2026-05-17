@@ -1,0 +1,112 @@
+# @package _global_
+# Stage 1 — V-JEPA v8 (multi-mask + hybrid cross-then-self predictor).
+# Entry point: `python src/pretrain_vjepa.py experiment=vjepa_pretrain_v8`
+#
+# Builds on v7's appearance-shortcut fix (pixel anchor + 90% tube mask):
+#   v7 broke the v4-v6 ceiling of 0.096 -> probe 0.21 (frozen + attn-pool).
+# Two surgical upgrades on top of v7, each well-motivated by V-JEPA paper findings:
+#
+#   1. MULTI-MASK M=3 (n_masks: 3). Single encoder forward, three independent
+#      tube-block masks per clip, predictor runs three times. ~3x more SSL
+#      signal per encoder step. V-JEPA 1's main sample-efficiency lever — paper
+#      reports +2-4 probe-pp from M=1 -> M=4 at fixed compute.
+#      Each of the M masks lands on a different spatial region, so the encoder
+#      is pressured to produce features that are predictable under varied
+#      visible windows (not just one fixed crop).
+#
+#   2. HYBRID CROSS-THEN-SELF PREDICTOR (predictor_type: hybrid,
+#      n_cross=3, n_self=2). Replaces v7's pure self-attention predictor with
+#      the V-JEPA 2 cross-attention pattern, plus a short self-attention tail:
+#         Phase A (extract): mask queries cross-attend to visible context only.
+#           No self-talk between mask positions -> removes V-JEPA 1's known
+#           shortcut where mask tokens collude through self-attention to satisfy
+#           the loss without leaning on the encoder.
+#         Phase B (refine): joint self-attention over [visible; queries] for
+#           global consistency. DETR-style "extract-then-refine".
+#      Forces more semantic work into the encoder; better-targeted gradient.
+#
+# Everything else mirrors v7:
+#   - ViT-S/16 + tubelet_size=2 -> token grid (T_tok=2, 14, 14) = 392 tokens.
+#   - 90% mask ratio (tube_block_v7 sampler, now multi-mask aware).
+#   - Loss = L1(LN(z_tgt)[mask]) + 0.5 * MSE(per-patch-LN rgb[mask]).
+#   - EMA 0.999 -> 1.0 cosine; AdamW; bf16; grad_clip 3.0; weight_decay 0.04.
+#   - Mild aug (RRC + clip-consistent ColorJitter, no flips); temporal jitter.
+#
+# Wall-clock budget: predictor compute is ~3x (M=3) but predictor << encoder,
+# so total step time ~1.3x v7. v7 was ~3.6 min/ep -> ~4.7 min/ep here.
+# 150 ep -> ~12h (target). Why 150 instead of 200: each step now carries ~3x
+# the SSL signal of v7, so we expect plateau ~ep 100-130 even on this data
+# (V-JEPA 1 paper shows multi-mask runs reach v7-equivalent loss in ~half the
+# epochs). 150 leaves a margin without paying the last 50 epochs of v7's
+# diminishing returns. Early-stop guard fires if no progress for 30 ep.
+#
+# Stage-2 reuse: experiment=exp11_vjepa_v8_spacetime loads
+# checkpoints/vjepa_stage1_v8.pt with tubelet_size=2.
+#
+# Pass criterion (probe gate via experiment=exp9_vjepa_probe_v8 + evaluate.py):
+#   ep 30 >= 0.15 real val | ep 80 >= 0.25 | ep 150 >= 0.30
+# If a gate misses badly, kill and revert to v7 baseline.
+
+vjepa:
+  variant: vit_s_16
+  image_size: 224
+  patch_size: 16
+  num_frames: 4
+  tubelet_size: 2
+  # Predictor: hybrid cross-then-self (3 cross-attn + 2 self-attn blocks at 384d).
+  predictor_dim: 384
+  predictor_depth: 5         # unused for hybrid (sum of n_cross + n_self), kept for cfg-hash stability
+  predictor_heads: 6
+  predictor_type: hybrid
+  predictor_n_cross: 3
+  predictor_n_self: 2
+  # Masking: same 90% tube-block as v7, but now M=3 distinct masks per clip.
+  mask_ratio: 0.90
+  n_masks: 3
+  mask_sampler: tube_block_v7
+  # Loss: v7 hybrid feature + pixel.
+  loss_type: jepa_pixel
+  pixel_weight: 0.5
+  # Aug: mild (RRC + clip-consistent ColorJitter, no flip — SSv2 direction-sensitive).
+  aug: mild
+  temporal_jitter: true
+
+training:
+  batch_size: 32
+  base_lr: 1.0e-3            # effective = base_lr * batch / 256 = 1.25e-4
+  final_lr: 1.0e-6
+  weight_decay: 0.04
+  warmup_epochs: 15
+  epochs: 150                # ~12h target with M=3 + hybrid predictor (vs 200 ep for v7)
+  amp: true
+  num_workers: 8
+  grad_clip: 3.0
+  ema_momentum_start: 0.999
+  ema_momentum_end: 1.0
+  loss_beta: 2.0
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1_v8.pt
+  device: cuda
+  max_nonfinite_streak: 50
+  early_stop_patience: 30
+  early_stop_min_delta: 1.0e-4
+  early_stop_min_epochs: 60
+
+wandb:
+  enabled: true
+  run_name: vjepa_stage1_v8
+  tags: [track1, stage1, vjepa, v8, multimask, hybrid-predictor, tubelet2, tube-mask-90]
+  notes: |
+    V-JEPA v8: multi-mask M=3 + hybrid cross->self predictor (3 cross + 2 self).
+    Builds on v7 (probe 0.21). V-JEPA 1's multi-mask + V-JEPA 2's cross-attn predictor.
+    arch: clip(B,4,3,224,224) -> Conv3d-tubelet -> 392 patch tokens
+        ctx_enc -> z_ctx -+
+                          +-- M=3 distinct tube-block masks
+        tgt_enc -> z_tgt -+
+        for m in range(3):
+          visible = z_ctx[~mask_m]
+          queries = mask_token + pos_embed[mask_m]
+          Phase A: queries x-attend visible (3 blocks) -> extract from encoder
+          Phase B: [visible; queries] self-attn (2 blocks) -> global consistency
+          z_pred_m -> L1 vs LN(z_tgt)[mask_m]  + 0.5 * MSE vs LN_patch(rgb)[mask_m]
+        loss = mean over m
+    Target: probe >= 0.30 (v7 was 0.21). 150 ep, ~12h.

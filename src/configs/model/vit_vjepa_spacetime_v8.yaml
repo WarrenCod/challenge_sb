@@ -1,0 +1,27 @@
+# @package _global_
+# Stage-2 model for V-JEPA v8: same head topology as v7 (4-layer joint
+# space-time transformer over patch tokens), but loads the v8 encoder
+# (multi-mask + hybrid cross-then-self predictor). Used by exp11_vjepa_v8_spacetime.
+model:
+  name: modular
+  num_classes: ${num_classes}
+  spatial:
+    name: vit_mae
+    variant: vit_s_16
+    image_size: 224
+    checkpoint_path: ${hydra:runtime.cwd}/checkpoints/vjepa_stage1_v8.pt
+    drop_path: 0.2
+    pool: tokens
+    freeze: false
+    tubelet_size: 2
+    num_frames: 4
+  temporal:
+    name: spacetime
+    num_heads: 6           # ViT-S width / 64
+    num_layers: 4
+    dim_feedforward: 1536  # 4 * embed_dim
+    dropout: 0.2
+    drop_path: 0.1
+    max_frames: 8
+  classifier:
+    name: linear

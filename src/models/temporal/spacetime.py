@@ -17,7 +17,7 @@ import torch.nn as nn
 from timm.models.vision_transformer import Block
 
 from models.base import TemporalProcessor
-from models.mae_vit import _sincos_2d_posembed
+from models._vit_utils import _sincos_2d_posembed
 
 
 class SpaceTimeTransformer(TemporalProcessor):

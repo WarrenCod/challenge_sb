@@ -156,6 +156,9 @@ def main(cfg: DictConfig) -> None:
         temporal_tube_fraction=float(cfg.vjepa.get("temporal_tube_fraction", 0.0)),
         pixel_weight=float(cfg.vjepa.get("pixel_weight", 0.5)),
         patch_size=int(cfg.vjepa.get("patch_size", 16)),
+        predictor_type=str(cfg.vjepa.get("predictor_type", "self")),
+        predictor_n_cross=int(cfg.vjepa.get("predictor_n_cross", 3)),
+        predictor_n_self=int(cfg.vjepa.get("predictor_n_self", 2)),
     ).to(device)
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6

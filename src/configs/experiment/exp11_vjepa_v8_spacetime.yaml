@@ -1,0 +1,51 @@
+# @package _global_
+# exp11 (Track 1): V-JEPA v8 Stage-2 fine-tune.
+# Mirror of exp10_vjepa_v7_spacetime — same head, same recipe — but loads the
+# v8 encoder (multi-mask + hybrid cross-then-self predictor). Apples-to-apples
+# vs v7: any val-acc delta is attributable to the Phase 1 changes.
+#
+# Recipe (unchanged from exp10): strong clip aug, mixup 0.2, drop_path 0.2
+# (encoder), dropout 0.2 (head), label smoothing 0.1, weight decay 0.05,
+# EMA 0.9999. Head fresh random init, encoder fully trainable with LLRD 0.70.
+#
+# One safe Phase-2 tweak vs exp10: extended schedule 80 -> 120 epochs.
+# exp10's val acc was still climbing at ep 80 (0.36, exp8 trajectory suggests
+# 0.45+ achievable with more epochs). 120 ep ~ exp10 + 50% wall-clock; if v8's
+# encoder is stronger than v7's, the head needs proportionally more steps to
+# extract that signal.
+#
+# Hard 20-ep gate: kill if val_acc < 0.20 by epoch 20.
+defaults:
+  - override /model: vit_vjepa_spacetime_v8
+
+dataset:
+  num_frames: 4
+
+training:
+  batch_size: 16
+  lr: 5.0e-4
+  llrd: 0.70
+  epochs: 120
+  warmup_epochs: 8           # +3 vs exp10's 5; the longer schedule wants a slightly longer warmup
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup_alpha: 0.2
+  strong_clip_aug: true
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.9999
+  num_workers: 8
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/exp11_vjepa_v8_spacetime.pt
+  device: cuda
+
+wandb:
+  enabled: true
+  run_name: exp11_vjepa_v8_spacetime
+  tags: [track1, stage2, vjepa, v8, multimask, hybrid-predictor, spacetime, joint-attn, regularized, ema]
+  notes: |
+    Stage-2 fine-tune of V-JEPA v8 (multi-mask M=3 + hybrid cross->self predictor).
+    Loads checkpoints/vjepa_stage1_v8.pt. Identical recipe to exp10 (v7) except
+    epochs 80 -> 120 and warmup 5 -> 8. Pure encoder-isolation ablation.
+    Target: real val >= 0.40 (vs exp10's 0.36); stretch >= 0.45.
